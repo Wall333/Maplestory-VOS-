@@ -62,7 +62,7 @@ class AlignmentRandomizerTests(unittest.TestCase):
         app.auto_align_direction = "Idle"
         app.auto_align_delta = None
         app.auto_align_move_count = 0
-        app.shop_controller = SimpleNamespace(state="idle")
+        app.shop_controller = SimpleNamespace(state="idle", needs_attention=lambda: False)
         app._reset_alignment_randomizer()
         app.alignment_overlay = SimpleNamespace(snapshot=lambda: (
             "Matched", (0, 0, 640, 480), (100, 100, 20, 20), None,
@@ -104,7 +104,7 @@ class AlignmentRandomizerTests(unittest.TestCase):
         app.auto_align_direction = "Idle"
         app.auto_align_delta = None
         app.auto_align_move_count = 0
-        app.shop_controller = SimpleNamespace(state="idle")
+        app.shop_controller = SimpleNamespace(state="idle", needs_attention=lambda: False)
         app._reset_alignment_randomizer()
         app.alignment_overlay = SimpleNamespace(snapshot=lambda: (
             "Matched", (0, 0, 640, 480),

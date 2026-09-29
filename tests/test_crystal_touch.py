@@ -71,7 +71,7 @@ class CrystalTouchTests(unittest.TestCase):
         app.auto_align_direction = "Idle"
         app.auto_align_delta = None
         app.auto_align_move_count = 0
-        app.shop_controller = SimpleNamespace(state="idle")
+        app.shop_controller = SimpleNamespace(state="idle", needs_attention=lambda: False)
         touched = []
         positions = iter(((100, 100, 20, 20), (250, 100, 20, 20)))
         app.alignment_overlay = SimpleNamespace(

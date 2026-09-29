@@ -34,7 +34,7 @@ class AlignmentSpamPauseTests(unittest.TestCase):
         app.spam_active = True
         app.alignment_move_pending = True
         app.spam_paused_reason = None
-        app.shop_controller = SimpleNamespace(test_cycle=False, tick=lambda: False)
+        app.shop_controller = SimpleNamespace(test_cycle=False, tick=lambda: False, needs_attention=lambda: False)
         app.map_detector = SimpleNamespace(allows_spam=lambda: True)
         app.yeti_detector = SimpleNamespace(allows_spam=lambda: self.fail("Yeti gate checked during movement"))
         with patch.object(vos_bot, "is_dreamms_active", return_value=True), \
@@ -52,7 +52,7 @@ class AlignmentSpamPauseTests(unittest.TestCase):
         app.spam_active = True
         app.alignment_move_pending = False
         app.spam_paused_reason = None
-        app.shop_controller = SimpleNamespace(test_cycle=False, tick=lambda: False)
+        app.shop_controller = SimpleNamespace(test_cycle=False, tick=lambda: False, needs_attention=lambda: False)
         app.map_detector = SimpleNamespace(allows_spam=lambda: True)
 
         def gate_then_move():
@@ -75,7 +75,7 @@ class AlignmentSpamPauseTests(unittest.TestCase):
         app.alignment_move_pending = False
         app.spam_paused_reason = "Moving"
         app.send_count = 0
-        app.shop_controller = SimpleNamespace(test_cycle=False, tick=lambda: False)
+        app.shop_controller = SimpleNamespace(test_cycle=False, tick=lambda: False, needs_attention=lambda: False)
         app.map_detector = SimpleNamespace(allows_spam=lambda: True)
         app.yeti_detector = SimpleNamespace(allows_spam=lambda: True)
         sent = []
@@ -105,7 +105,7 @@ class AlignmentSpamPauseTests(unittest.TestCase):
         app.auto_align_direction = "Idle"
         app.auto_align_delta = None
         app.auto_align_move_count = 0
-        app.shop_controller = SimpleNamespace(state="idle")
+        app.shop_controller = SimpleNamespace(state="idle", needs_attention=lambda: False)
         positions = iter(((0, 100, 20, 20), (310, 100, 20, 20)))
         app.alignment_overlay = SimpleNamespace(snapshot=lambda: (
             "Matched", (0, 0, 640, 480), next(positions), None,
@@ -130,7 +130,7 @@ class AlignmentSpamPauseTests(unittest.TestCase):
         app.alignment_move_pending = True
         app.auto_align_direction = "Idle"
         app.auto_align_delta = None
-        app.shop_controller = SimpleNamespace(state="idle")
+        app.shop_controller = SimpleNamespace(state="idle", needs_attention=lambda: False)
         app.alignment_overlay = SimpleNamespace(snapshot=lambda: (
             "Missing", (0, 0, 640, 480), None, None,
             0.0, 0.0, time.monotonic(), None, 0.0, 0))

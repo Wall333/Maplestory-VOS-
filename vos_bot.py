@@ -72,24 +72,24 @@ DEFAULTS = {
     "alignment_overlay_enabled": True,
     "alignment_checks_per_second": 10,
     "alignment_match_threshold": 0.70,
-    "character_tracker_mode": "lightbulb",
+    "character_tracker_mode": "arrows",
     "arrow_match_threshold": 0.60,
     "vision_roi_padding": 120,
-    "log_panel_height": 130,
+    "log_panel_height": 154,
     "alignment_target_mode": "manual",
-    "manual_anchor_offset": 0,
+    "manual_anchor_offset": -22,
     "auto_align_enabled": True,
     "auto_align_tolerance_pixels": 200,
-    "auto_align_key_hold": 0.5,
+    "auto_align_key_hold": 0.4,
     "auto_align_interval": 0.5,
-    "auto_align_randomize": False,
-    "auto_align_random_tolerance_min_pixels": 150,
-    "auto_align_random_tolerance_max_pixels": 250,
-    "auto_align_random_delay_min_seconds": 0.25,
-    "auto_align_random_delay_max_seconds": 0.75,
+    "auto_align_randomize": True,
+    "auto_align_random_tolerance_min_pixels": 100,
+    "auto_align_random_tolerance_max_pixels": 200,
+    "auto_align_random_delay_min_seconds": 2.0,
+    "auto_align_random_delay_max_seconds": 10.0,
     "show_spammer_overlay": True,
-    "show_latency_overlay": False,
-    "latency_overlay_x_percent": 15,
+    "show_latency_overlay": True,
+    "latency_overlay_x_percent": 20,
     "latency_overlay_y_percent": 5,
     "spam_overlay_x_percent": 85,
     "spam_overlay_y_percent": 4,
@@ -104,11 +104,11 @@ DEFAULTS = {
     "monster_area_top_offset": -120,
     "monster_area_bottom_offset": 120,
     "show_monster_area": False,
-    "yeti_match_threshold": 0.50,
+    "yeti_match_threshold": 0.70,
     "buff_enabled": True,
     "buff_key": "END",
     "buff_key_hold": 0.03,
-    "buff_wait_seconds": 5.0,
+    "buff_wait_seconds": 1.0,
     "thorns_checks_per_second": 2,
     "thorns_match_threshold": 0.50,
     "use_arduino": True,
@@ -1992,7 +1992,9 @@ class VosApp:
                 if not is_dreamms_active():
                     self.stop_vos("Shop test lost game focus")
                     return
-                if not self.shop_controller.tick():
+                with self.input_lock:
+                    shop_owned = self.shop_controller.tick()
+                if not shop_owned:
                     return
                 self.stop_event.wait(.05)
         finally:
@@ -2246,7 +2248,7 @@ class VosApp:
                 self.alignment_move_pending = False
                 self.auto_align_stop.wait(0.10)
                 continue
-            if self.shop_controller.state != "idle":
+            if self.shop_controller.needs_attention():
                 self._reset_alignment_randomizer()
                 self.auto_align_direction = "Selling"
                 self.auto_align_stop.wait(.1)
@@ -2381,6 +2383,7 @@ class VosApp:
             with self.input_lock:
                 can_move = (self.config.get("auto_align_enabled", False)
                     and self.spam_active and self.shop_controller.state == "idle"
+                    and not self.shop_controller.needs_attention()
                     and self.spam_paused_reason in (None, "Moving", "Waiting for Yeti/Crown"))
                 if not can_move:
                     sent = None
@@ -2469,17 +2472,18 @@ class VosApp:
             if not is_dreamms_active():
                 self.stop_vos("DreamMS window lost focus")
                 return
-            # A manual shop test owns inputs even when the map gate is missing.
-            # Normal spam is checked against the map again after the test ends.
-            if self.shop_controller.test_cycle:
-                if self.shop_controller.tick():
-                    self.stop_event.wait(.05)
-                    continue
+            # A shop cycle owns input ahead of map, buff, movement and skill
+            # gates. This also lets manual test work when the map is missing.
+            with self.input_lock:
+                shop_owned = self.shop_controller.tick()
+            if shop_owned:
+                self.stop_event.wait(.05)
+                continue
             if not self.map_detector.allows_spam():
                 self.spam_paused_reason = "Waiting for map"
                 self.stop_event.wait(.05)
                 continue
-            if self.shop_controller.tick():
+            if self.shop_controller.needs_attention():
                 self.stop_event.wait(.05)
                 continue
             if self.config.get("buff_enabled", False):
@@ -2494,11 +2498,14 @@ class VosApp:
                     self.spam_paused_reason = "Buffing (casting Thorns)"
                     buff_key = normalize_output_key(self.config.get("buff_key", "END"))
                     buff_hold = max(0.001, float(self.config.get("buff_key_hold", 0.03)))
-                    if self.config.get("use_arduino", True):
-                        sent = ARDUINO.send_key(self.config, buff_key, buff_hold)
-                    else:
-                        send_windows_key(buff_key, buff_hold)
-                        sent = True
+                    with self.input_lock:
+                        if self.shop_controller.needs_attention():
+                            continue
+                        if self.config.get("use_arduino", True):
+                            sent = ARDUINO.send_key(self.config, buff_key, buff_hold)
+                        else:
+                            send_windows_key(buff_key, buff_hold)
+                            sent = True
                     if not sent:
                         self.stop_vos("Thorns buff key send failed")
                         return
@@ -2521,7 +2528,8 @@ class VosApp:
                 continue
             with self.input_lock:
                 moving = bool(self.config.get("auto_align_enabled", False) and self.alignment_move_pending)
-                if not moving:
+                selling_pending = self.shop_controller.needs_attention()
+                if not moving and not selling_pending:
                     self.spam_paused_reason = None
                     if config.get("use_arduino", True):
                         sent = ARDUINO.send_key(config, key, hold)
@@ -2533,13 +2541,21 @@ class VosApp:
                 if self.stop_event.wait(.05):
                     break
                 continue
+            if selling_pending:
+                self.stop_event.wait(.05)
+                continue
             if not sent:
                 log("VoS stopped: Arduino send failed")
                 self.stop_vos("Arduino disconnected")
                 return
             self.send_count += 1
-            if self.stop_event.wait(interval):
-                break
+            deadline = time.monotonic() + interval
+            while not self.stop_event.is_set():
+                if self.shop_controller.needs_attention():
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or self.stop_event.wait(min(.05, remaining)):
+                    break
 
     def refresh_status(self):
         metrics = self.vision.summary()

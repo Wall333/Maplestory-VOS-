@@ -1,6 +1,6 @@
 # Maplestory VOS
 
-Current release: **2.1.0**. See [CHANGELOG.md](CHANGELOG.md) for the release
+Current release: **2.1.1**. See [CHANGELOG.md](CHANGELOG.md) for the release
 summary. This repository contains the full Python source, image assets,
 Arduino/Teensy firmware, tests, and a self-contained Windows release ZIP.
 
@@ -11,9 +11,9 @@ A separate Windows helper that repeatedly sends a selected key while
 ## Current packaged defaults
 
 - Spam `F` every 2 seconds.
-- Manual green anchor at the horizontal center (`0px`).
+- Manual green anchor 22px left of the horizontal center (`-22px`).
 - Auto-align enabled with a 0.4s movement hold. Random mode is on by default:
-  50–200px happy tolerance and a 2–10s pre-move wait while spam continues.
+  100–200px happy tolerance and a 2–10s pre-move wait while spam continues.
   Fixed-mode values (when random mode is off) are 200px tolerance and a 0.5s
   correction interval.
 - Crystal display/looting, Yeti-required spam, and Thorns maintenance enabled.
@@ -23,7 +23,7 @@ A separate Windows helper that repeatedly sends a selected key while
 
 ## Portable Windows package
 
-Download `Maplestory-VOS-v2.1.0-Windows-x64.zip` from the GitHub release,
+Download `Maplestory-VOS-v2.1.1-Windows-x64.zip` from the GitHub release,
 extract the **entire** archive, and run `Maplestory-VOS.exe`. It includes Python and the required desktop
 libraries; the other files and `_internal` directory must stay beside the EXE.
 Settings and logs are written beside the EXE, so extract to a writable folder
@@ -205,8 +205,8 @@ higher rates use more CPU. Enter a rate and save settings to apply it.
 
 While VoS spam is running, the bot also checks `shop_open.png` for a shop that
 was opened unexpectedly. The shop-open check rate is separate (default once per
-second, adjustable from 0.2 to 10 per second). If the inventory is clean or
-`invent_empty.png` is visible, it closes the shop. If the inventory has changed,
+second, adjustable from 0.2 to 10 per second). If the inventory is clean,
+it closes the shop. If the inventory has changed,
 the **Sell changed inventory if shop is already open** option continues the
 selling sequence when automatic selling is enabled; otherwise it closes the
 shop. Spam pauses while the shop is being handled. If inventory cannot be
@@ -224,11 +224,14 @@ afterward; with spam off it runs the cycle alone. Repeated hotkey presses during
 selling are ignored. DreamMS must be foreground; losing focus cancels the test.
 
 The sequence clicks `shop.png`, waits for `shop_open.png`, clicks
-`sell_button.png`, confirms `sell_confirm.png` with Y, then requires both
-`shop_open.png` and `invent_empty.png` before clicking `shop_exit.png`. Inputs
-are spaced by one second and spam/movement pause throughout selling. The shop
-must disappear before spam resumes. Missing templates leave the sequence
-waiting rather than advancing blindly.
+`sell_button.png`, and confirms `sell_confirm.png` with Y. Once the confirmation
+disappears and the shop is visible, it clicks `shop_exit.png` without waiting
+for `invent_empty.png`. Shop actions take input priority over spam, buffs,
+alignment, and the map gate. After the shop closes, automatic selling keeps
+spam paused until fresh inventory checks: two clean checks resume normal
+operation; a changed inventory starts another shop pass. The F8 test still
+runs only one cycle. Missing detection keeps the active sale paused rather
+than handing input back to spam.
 
 The in-game badge and VoS status say **BUFFING** while the Thorns buff key is
 being cast or the configured post-cast wait is in progress.

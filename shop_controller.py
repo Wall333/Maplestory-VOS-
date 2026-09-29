@@ -14,9 +14,12 @@ class ShopController:
         self.inventory_rect = None
         self.context = None
         self.changed = False
+        self.changed_pending = False
         self.matches = {}
         self.checked = 0.0
         self.next_action = 0.0
+        self.recheck_after = 0.0
+        self.recheck_clean_checks = 0
         self.shop_open_checked = 0.0
         self.shop_open_rect = None
         self.templates = {}
@@ -35,6 +38,26 @@ class ShopController:
         self.state = "idle"
         self.test_cycle = False
         self.next_action = 0.0
+        self.recheck_after = 0.0
+        self.recheck_clean_checks = 0
+        self.changed_pending = False
+
+    def needs_attention(self):
+        """Let spam/movement yield as soon as a fresh inventory change appears."""
+        if self.state != "idle" or self.test_cycle:
+            return True
+        if not self.app.config.get("shop_enabled", False) or not self.app.spam_active:
+            return False
+        with self.lock:
+            checked = self.checked
+            pending = self.changed_pending
+            context = self.context
+            shop_open = "shop_open" in self.matches
+        rate = max(1.0, min(30.0, float(self.app.config.get("inventory_checks_per_second", 5))))
+        shop_rate = max(.2, min(10.0, float(self.app.config.get("shop_open_checks_per_second", 1))))
+        max_age = max(.6, 2.0 / rate, 1.0 / shop_rate + .2)
+        return context is not None and (pending or
+            (time.monotonic() - checked <= max_age and shop_open))
 
     def request_test(self):
         if self.state != "idle":
@@ -46,7 +69,7 @@ class ShopController:
 
     def detect_shared(self):
         vision = self.app.vision
-        names = ("inventory", "shop", "shop_open", "sell_button", "sell_confirm", "invent_empty", "shop_exit")
+        names = ("inventory", "shop", "shop_open", "sell_button", "sell_confirm", "shop_exit")
         for name in names:
             if name not in vision.templates:
                 self.status = "Missing " + name + ".png"
@@ -76,6 +99,7 @@ class ShopController:
                         self.context = None
                         self.inventory_rect = None
                         self.changed = False
+                        self.changed_pending = False
                         self.matches = {}
                     self.cached_locations.clear()
                     self.cached_context = None
@@ -88,6 +112,8 @@ class ShopController:
                     self.cached_context = context
                     self.shop_open_rect = None
                     self.shop_open_checked = 0.0
+                    with self.lock:
+                        self.changed_pending = False
                 threshold = float(self.app.config.get("shop_match_threshold", .9))
                 padding = int(self.app.config.get("vision_roi_padding", 120))
                 shop_rate = max(.2, min(10.0, float(self.app.config.get("shop_open_checks_per_second", 1))))
@@ -107,11 +133,13 @@ class ShopController:
                 elif state == "open":
                     needed = ("shop",)
                 elif state == "inspect":
-                    needed = ("inventory", "invent_empty")
+                    needed = ("inventory",)
                 elif state == "sell":
                     needed = ("sell_button", "sell_confirm")
                 elif state == "confirm":
-                    needed = ("sell_confirm", "invent_empty")
+                    needed = ("sell_confirm",)
+                elif state == "recheck":
+                    needed = ()
                 else:
                     needed = ("shop_exit",)
                 for name in needed:
@@ -149,6 +177,8 @@ class ShopController:
                 with self.lock:
                     self.context, self.matches = context, matches
                     self.inventory_rect, self.changed = rect, changed
+                    if changed and self.state == "idle" and self.app.config.get("shop_enabled") and self.app.spam_active:
+                        self.changed_pending = True
                     self.checked = time.monotonic()
                 self.status = "Inventory changed" if changed else ("Inventory clean" if rect else "Inventory not detected")
                 vision.record("cycle.shop", time.perf_counter() - started)
@@ -176,6 +206,7 @@ class ShopController:
         auto_sell = bool(self.app.config.get("shop_enabled", False))
         with self.lock:
             context, changed, checked = self.context, self.changed, self.checked
+            changed_pending = self.changed_pending
             matches = dict(self.matches)
             inventory_rect = self.inventory_rect
         rate = max(1.0, min(30.0, float(self.app.config.get("inventory_checks_per_second", 5))))
@@ -187,8 +218,9 @@ class ShopController:
             if "shop_open" in matches:
                 self.state = "inspect"
                 self.api["log"]("Shop already open: checking inventory")
-            elif changed and auto_sell:
+            elif (changed or changed_pending) and auto_sell:
                 self.state = "open"
+                self.changed_pending = False
                 self.api["log"]("Selling: inventory changed; opening shop")
             else:
                 return False
@@ -198,24 +230,49 @@ class ShopController:
         if context is None or time.monotonic() - checked > max_age or time.monotonic() < self.next_action:
             return True
         target = None
+        if self.state == "recheck":
+            if "shop_open" in matches:
+                self.state = "exit"
+                return True
+            if checked <= self.recheck_after:
+                return True
+            if inventory_rect is None:
+                self.app.spam_paused_reason = "Selling: checking inventory"
+                return True
+            if changed:
+                self.state = "open"
+                self.changed_pending = False
+                self.recheck_clean_checks = 0
+                self.api["log"]("Inventory still changed: retrying shop sale")
+            else:
+                self.recheck_clean_checks += 1
+                self.recheck_after = checked
+                if self.recheck_clean_checks < 2:
+                    return True
+                self.reset()
+                self.api["log"]("Selling complete: inventory clean")
+                return False
         if self.state == "inspect":
             if "shop_open" not in matches:
-                self.reset()
-                return False
-            if "invent_empty" in matches or "inventory" in matches or (inventory_rect is not None and not changed):
-                self.state = "exit"
-                self.api["log"]("Shop open with clean/empty inventory: closing shop")
-            elif changed:
+                if self.test_cycle or not auto_sell or not self.app.spam_active:
+                    self.reset()
+                    return False
+                self.state = "recheck"
+                self.recheck_after = checked
+                self.recheck_clean_checks = 0
+                self.next_action = time.monotonic() + .5
+                return True
+            if changed:
                 self.state = "sell" if auto_sell and self.app.config.get("shop_open_auto_sell", True) else "exit"
                 self.api["log"]("Shop open with changed inventory: " + ("selling" if self.state == "sell" else "closing shop"))
+            elif "inventory" in matches or inventory_rect is not None:
+                self.state = "exit"
+                self.api["log"]("Shop open with clean/empty inventory: closing shop")
         elif self.state == "open":
             if "shop_open" in matches:
                 self.state = "sell"
-            elif changed or self.test_cycle:
-                target = matches.get("shop")
             else:
-                self.reset()
-                return False
+                target = matches.get("shop")
         elif self.state == "sell":
             if "sell_confirm" in matches:
                 self.state = "confirm"
@@ -231,13 +288,20 @@ class ShopController:
                 if not sent:
                     self.app.stop_vos("Selling: confirmation key failed")
                 self.next_action = time.monotonic() + 1
-            elif "shop_open" in matches and "invent_empty" in matches:
+            elif "shop_open" in matches:
                 self.state = "exit"
         elif self.state == "exit":
             if "shop_open" not in matches:
-                self.reset()
-                self.api["log"]("Selling complete: shop closed")
-                return False
+                if self.test_cycle or not auto_sell or not self.app.spam_active:
+                    self.reset()
+                    self.api["log"]("Shop closed; test cycle complete")
+                    return False
+                self.state = "recheck"
+                self.recheck_after = checked
+                self.recheck_clean_checks = 0
+                self.next_action = time.monotonic() + .5
+                self.api["log"]("Shop closed; rechecking inventory before resuming")
+                return True
             target = matches.get("shop_exit")
         if target is not None:
             if not self.click(target, context):

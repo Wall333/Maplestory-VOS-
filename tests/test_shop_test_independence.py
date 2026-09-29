@@ -48,6 +48,7 @@ class ShopTestIndependenceTests(unittest.TestCase):
         app.spam_active = False
         app.worker = None
         app.stop_event = threading.Event()
+        app.input_lock = threading.Lock()
         app.shop_controller = SimpleNamespace(
             state="idle", request_test=lambda: calls.append("requested") or True)
         app.map_detector = SimpleNamespace(allows_spam=lambda: self.fail("map gate used"))
@@ -75,6 +76,7 @@ class ShopTestIndependenceTests(unittest.TestCase):
         app = vos_bot.VosApp.__new__(vos_bot.VosApp)
         app.config = {"vos_hold": .03, "vos_interval": .1, "vos_output_key": "X"}
         app.stop_event = threading.Event()
+        app.input_lock = threading.Lock()
         calls = []
 
         def shop_tick():
@@ -88,14 +90,33 @@ class ShopTestIndependenceTests(unittest.TestCase):
             app._spam_loop()
         self.assertEqual(calls, ["shop"])
 
+    def test_auto_sale_owns_input_before_map_gate(self):
+        app = vos_bot.VosApp.__new__(vos_bot.VosApp)
+        app.config = {"vos_hold": .03, "vos_interval": .1, "vos_output_key": "X"}
+        app.stop_event = threading.Event()
+        app.input_lock = threading.Lock()
+        calls = []
+
+        def shop_tick():
+            calls.append("auto-sale")
+            app.stop_event.set()
+            return True
+
+        app.shop_controller = SimpleNamespace(test_cycle=False, tick=shop_tick)
+        app.map_detector = SimpleNamespace(allows_spam=lambda: self.fail("map checked before auto-sale"))
+        with patch.object(vos_bot, "is_dreamms_active", return_value=True):
+            app._spam_loop()
+        self.assertEqual(calls, ["auto-sale"])
+
     def test_spam_worker_waits_for_missing_map_without_stopping(self):
         app = vos_bot.VosApp.__new__(vos_bot.VosApp)
         app.config = {"vos_hold": .03, "vos_interval": .1, "vos_output_key": "X"}
         app.stop_event = threading.Event()
+        app.input_lock = threading.Lock()
         app.spam_active = True
         app.spam_paused_reason = None
         app.shop_controller = SimpleNamespace(test_cycle=False,
-            tick=lambda: self.fail("shop checked while map missing"))
+            tick=lambda: False, needs_attention=lambda: False)
 
         def map_missing():
             app.stop_event.set()

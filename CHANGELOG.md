@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.1.1
+
+- Make automatic selling take priority over the map gate, buffs, movement,
+  and skill spam as soon as a changed inventory is detected.
+- Keep a sale latched when later inventory frames flicker, instead of
+  alternating between selling and spamming.
+- Exit the shop after confirmation disappears without depending on
+  `invent_empty.png`; recheck inventory afterward and retry if it is still
+  changed. Resume normal operation only after two fresh clean checks.
+- Use the current saved `config.json` values as the built-in fallback defaults
+  and in the Windows release package.
+
 ## 2.1.0
 
 - Share one DreamMS capture stream across image detectors, reuse preprocessing,
