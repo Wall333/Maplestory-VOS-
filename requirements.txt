@@ -1,0 +1,7 @@
+keyboard
+mss
+numpy
+opencv-python
+psutil
+pyserial
+pywin32

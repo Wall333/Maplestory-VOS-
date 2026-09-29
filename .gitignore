@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+recent_logs.txt
+.build-v2/
+.dist-v2/
+Releases/
