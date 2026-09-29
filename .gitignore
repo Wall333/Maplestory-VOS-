@@ -1,6 +1,8 @@
 __pycache__/
 *.pyc
 recent_logs.txt
+activity_logs.txt
+diagnostic_logs.txt
 .build-v2/
 .dist-v2/
 Releases/

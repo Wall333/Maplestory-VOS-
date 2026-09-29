@@ -2,9 +2,11 @@ import ctypes
 import json
 import os
 import queue
+import random
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from concurrent.futures import as_completed
 from collections import deque
 import tkinter as tk
@@ -43,6 +45,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_DIR = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else BASE_DIR
 CONFIG_PATH = os.path.join(SETTINGS_DIR, "config.json")
 LOG_PATH = os.path.join(SETTINGS_DIR, "recent_logs.txt")
+ACTIVITY_LOG_PATH = os.path.join(SETTINGS_DIR, "activity_logs.txt")
+DIAGNOSTIC_LOG_PATH = os.path.join(SETTINGS_DIR, "diagnostic_logs.txt")
 
 DEFAULTS = {
     "shop_test_enabled": True,
@@ -78,6 +82,11 @@ DEFAULTS = {
     "auto_align_tolerance_pixels": 200,
     "auto_align_key_hold": 0.5,
     "auto_align_interval": 0.5,
+    "auto_align_randomize": False,
+    "auto_align_random_tolerance_min_pixels": 150,
+    "auto_align_random_tolerance_max_pixels": 250,
+    "auto_align_random_delay_min_seconds": 0.25,
+    "auto_align_random_delay_max_seconds": 0.75,
     "show_spammer_overlay": True,
     "show_latency_overlay": False,
     "latency_overlay_x_percent": 15,
@@ -136,6 +145,24 @@ OUTPUT_ALIASES = {
 }
 
 LOG_BUFFER = deque(maxlen=300)
+DIAGNOSTIC_LOG_BUFFER = deque(maxlen=500)
+
+
+@dataclass(frozen=True)
+class AlignmentMoveOrder:
+    target_id: tuple
+    tolerance_pixels: int
+    wait_seconds: float
+    ready_at: float
+
+
+def sample_alignment_move_order(config, now, target_id, rng=random):
+    tolerance_min = max(0, int(config.get("auto_align_random_tolerance_min_pixels", 150)))
+    tolerance_max = max(tolerance_min, int(config.get("auto_align_random_tolerance_max_pixels", 250)))
+    delay_min = max(0.0, float(config.get("auto_align_random_delay_min_seconds", .25)))
+    delay_max = max(delay_min, float(config.get("auto_align_random_delay_max_seconds", .75)))
+    delay = max(delay_min, min(delay_max, rng.uniform(delay_min, delay_max)))
+    return AlignmentMoveOrder(target_id, rng.randint(tolerance_min, tolerance_max), delay, now + delay)
 
 
 def load_config():
@@ -151,12 +178,15 @@ def save_config(config):
         json.dump(config, handle, indent=2)
 
 
-def log(message):
+def log(message, *, diagnostic=False):
     entry = f"[{time.strftime('%H:%M:%S')}] {message}"
-    LOG_BUFFER.append(entry)
+    (DIAGNOSTIC_LOG_BUFFER if diagnostic else LOG_BUFFER).append(entry)
     print(entry)
     try:
         with open(LOG_PATH, "a", encoding="utf-8") as handle:
+            handle.write(entry + "\n")
+        with open(DIAGNOSTIC_LOG_PATH if diagnostic else ACTIVITY_LOG_PATH,
+                  "a", encoding="utf-8") as handle:
             handle.write(entry + "\n")
     except OSError:
         pass
@@ -290,7 +320,7 @@ class ArduinoConnection:
                 self._serial.write(payload.encode("ascii"))
                 self._serial.flush()
                 if not self._logged_first_send:
-                    log(f"Arduino write confirmed: {payload.strip()} -> {self._port}")
+                    log(f"Arduino write confirmed: {payload.strip()} -> {self._port}", diagnostic=True)
                     self._logged_first_send = True
                 return True
             except (OSError, serial.SerialException):
@@ -356,7 +386,7 @@ class VosMapDetector:
             self.score = float(score)
             self.last_check = time.monotonic()
         if changed:
-            log(f"VoS Map Checker: {status} | match={score:.3f}")
+            log(f"VoS Map Checker: {status} | match={score:.3f}", diagnostic=True)
 
 
     def _shared_loop(self):
@@ -469,7 +499,7 @@ class YetiDetector:
             self.last_check = time.monotonic()
             self.match_rects = list(rects or []) if matched else []
         if changed and status in {"Detected", "Not detected"}:
-            log(f"Yeti/Crown Gate: {status} | match={score:.3f}")
+            log(f"Yeti/Crown Gate: {status} | match={score:.3f}", diagnostic=True)
 
     def _shared_loop(self):
         vision = self.app.vision
@@ -608,7 +638,7 @@ class ThornsDetector:
             self.last_check = time.monotonic()
             self.match_rect = match_rect if matched else None
         if changed and status in {"Active", "Missing"}:
-            log(f"Thorns Buff: {status} | match={score:.3f}")
+            log(f"Thorns Buff: {status} | match={score:.3f}", diagnostic=True)
 
     def _shared_loop(self):
         vision = self.app.vision
@@ -675,6 +705,8 @@ class AlignmentOverlay:
         self.crystal_generation = 0
         self.crystal_visible = False
         self.crystal_missing_frames = 0
+        self.crystal_ignored_match = None
+        self.crystal_ignored_missing_frames = 0
         self.status = "Off"
         self.last_check = 0.0
 
@@ -754,9 +786,42 @@ class AlignmentOverlay:
             self.crystal_score = 0.0
             self.crystal_visible = False
             self.crystal_missing_frames = 0
+            self.crystal_ignored_match = None
+            self.crystal_ignored_missing_frames = 0
+
+    def touch_crystal(self, generation, match):
+        """Retire only the crystal currently being pursued until it disappears."""
+        with self.lock:
+            if self.crystal_match is None or generation != self.crystal_generation:
+                return False
+            current_x = self.crystal_match[0] + self.crystal_match[2] / 2.0
+            touched_x = match[0] + match[2] / 2.0
+            if abs(current_x - touched_x) > max(8, self.crystal_match[2] / 2.0):
+                return False
+            self.crystal_ignored_match = self.crystal_match
+            self.crystal_ignored_missing_frames = 0
+            self.crystal_match = None
+            self.crystal_score = 0.0
+            self.crystal_visible = False
+            log(f"Crystal line reached at x={current_x:.1f}; guide retired until crystal disappears")
+            return True
 
     def _update_crystal(self, match, score, rate):
         with self.lock:
+            if self.crystal_ignored_match is not None:
+                if match is None:
+                    self.crystal_ignored_missing_frames += 1
+                    if self.crystal_ignored_missing_frames >= max(2, int(rate * 0.5)):
+                        self.crystal_ignored_match = None
+                        self.crystal_ignored_missing_frames = 0
+                else:
+                    ignored_x = self.crystal_ignored_match[0] + self.crystal_ignored_match[2] / 2.0
+                    match_x = match[0] + match[2] / 2.0
+                    if abs(match_x - ignored_x) <= max(8, self.crystal_ignored_match[2] / 2.0):
+                        self.crystal_ignored_missing_frames = 0
+                        return
+                    self.crystal_ignored_match = None
+                    self.crystal_ignored_missing_frames = 0
             if match is not None:
                 is_new = not self.crystal_visible
                 if self.crystal_match is not None:
@@ -767,7 +832,7 @@ class AlignmentOverlay:
                     self.crystal_generation += 1
                     log(
                         f"Crystal target detected: generation={self.crystal_generation}, "
-                        f"x={match[0] + match[2] / 2.0:.1f}, match={score:.3f}"
+                        f"x={match[0] + match[2] / 2.0:.1f}, match={score:.3f}", diagnostic=True
                     )
                 self.crystal_match = match
                 self.crystal_score = float(score)
@@ -778,7 +843,7 @@ class AlignmentOverlay:
                 self.crystal_missing_frames += 1
                 if self.crystal_missing_frames >= max(2, int(rate * 0.5)):
                     if self.crystal_match is not None:
-                        log("Crystal target cleared: crystal is no longer detected")
+                        log("Crystal target cleared: crystal is no longer detected", diagnostic=True)
                     self.crystal_visible = False
                     self.crystal_match = None
 
@@ -796,6 +861,8 @@ class AlignmentOverlay:
                 self.bulb_score = self.area_score = self.crystal_score = 0.0
                 self.crystal_visible = False
                 self.crystal_missing_frames = 0
+                self.crystal_ignored_match = None
+                self.crystal_ignored_missing_frames = 0
                 self.last_check = 0.0
                 self.status = "Starting" if context else "Game inactive"
                 self.context_sequence = packet.sequence
@@ -899,7 +966,8 @@ class AlignmentOverlay:
                 needs_character = config.get("alignment_overlay_enabled", False) or config.get("auto_align_enabled", False)
                 manual = config.get("alignment_target_mode", "area") == "manual"
                 with self.lock:
-                    previous_area, previous_crystal = self.area_match, self.crystal_match
+                    previous_area = self.area_match
+                    previous_crystal = self.crystal_match or self.crystal_ignored_match
                 jobs = {}
                 if needs_character and not manual:
                     jobs["area"] = vision.pool.submit(
@@ -1039,6 +1107,7 @@ class AlignmentOverlay:
                     reason = self.app.spam_paused_reason
                     label = ("SELLING" if reason.startswith("Selling") else
                              "BUFFING" if reason.startswith("Buffing") else
+                             "MOVING" if reason == "Moving" else
                              "SPAMMER WAITING")
                     color = "#ffc400"
                 else:
@@ -1136,14 +1205,16 @@ class VosApp:
         self.spam_paused_reason = None
         self.buff_resume_not_before = 0.0
         self.stop_event = threading.Event()
+        self.input_lock = threading.Lock()
         self.worker = None
         self.send_count = 0
         self.last_window_active = None
         self.last_arduino_status = None
         self.hotkey_handles = []
         self.ui_actions = queue.SimpleQueue()
-        self.vision = VisionRuntime(self, BASE_DIR, get_active_dreamms_context, log)
-        log(f"Vision workers=3 general + 1 dedicated character; OpenCV internal threads={cv2.getNumThreads()}")
+        self.vision = VisionRuntime(self, BASE_DIR, get_active_dreamms_context,
+            lambda message: log(message, diagnostic=message.startswith("Vision perf")))
+        log(f"Vision workers=3 general + 1 dedicated character; OpenCV internal threads={cv2.getNumThreads()}", diagnostic=True)
         self.map_detector = VosMapDetector(self)
         self.yeti_detector = YetiDetector(self)
         self.thorns_detector = ThornsDetector(self)
@@ -1153,6 +1224,12 @@ class VosApp:
         self.auto_align_thread = None
         self.auto_align_direction = "Idle"
         self.auto_align_delta = None
+        self.alignment_move_pending = False
+        self.auto_align_move_order = None
+        self.auto_align_random_tolerance = None
+        self.auto_align_order_target = None
+        self.auto_align_last_move_check = 0.0
+        self.auto_align_correction_active = False
         self.auto_align_move_count = 0
         self._anchor_save_job = None
         self._monster_area_save_job = None
@@ -1215,7 +1292,7 @@ class VosApp:
         self.main_paned.pack(fill="both", expand=True, padx=16, pady=(0, 10))
         self.notebook = ttk.Notebook(self.main_paned)
         self.main_paned.add(self.notebook, weight=4)
-        logs = ttk.LabelFrame(self.main_paned, text="Recent logs (drag divider above to resize)", padding=6)
+        logs = ttk.LabelFrame(self.main_paned, text="Logs (drag divider above to resize)", padding=6)
         self.log_panel = logs
         self.main_paned.add(logs, weight=1)
         self._logs_restored = False
@@ -1437,7 +1514,7 @@ class VosApp:
         self.map_threshold.insert(0, str(self.config["vos_map_match_threshold"]))
         self.map_threshold.grid(row=2, column=1, sticky="w")
 
-        overlay = ttk.LabelFrame(alignment_tab, text="Character / Area Alignment Test", padding=10)
+        overlay = ttk.LabelFrame(alignment_tab, text="Alignment target and in-game guides", padding=10)
         overlay.pack(fill="x", pady=(10, 0))
         self.alignment_enabled = tk.BooleanVar(value=bool(self.config["alignment_overlay_enabled"]))
         ttk.Checkbutton(
@@ -1469,15 +1546,15 @@ class VosApp:
             variable=self.auto_align_enabled,
             command=self.on_auto_align_changed,
         ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(7, 0))
-        ttk.Label(overlay, text="Happy tolerance (pixels):").grid(row=4, column=0, sticky="w", pady=5)
+        ttk.Label(overlay, text="Fixed happy tolerance (px):").grid(row=4, column=0, sticky="w", pady=5)
         self.auto_align_tolerance = ttk.Entry(overlay, width=14)
         self.auto_align_tolerance.insert(0, str(self.config["auto_align_tolerance_pixels"]))
         self.auto_align_tolerance.grid(row=4, column=1, sticky="w")
-        ttk.Label(overlay, text="Movement key hold (seconds):").grid(row=5, column=0, sticky="w", pady=5)
+        ttk.Label(overlay, text="Movement key hold (s, both modes):").grid(row=5, column=0, sticky="w", pady=5)
         self.auto_align_hold = ttk.Entry(overlay, width=14)
         self.auto_align_hold.insert(0, str(self.config["auto_align_key_hold"]))
         self.auto_align_hold.grid(row=5, column=1, sticky="w")
-        ttk.Label(overlay, text="Correction interval (seconds):").grid(row=6, column=0, sticky="w", pady=5)
+        ttk.Label(overlay, text="Fixed correction interval (s):").grid(row=6, column=0, sticky="w", pady=5)
         self.auto_align_interval = ttk.Entry(overlay, width=14)
         self.auto_align_interval.insert(0, str(self.config["auto_align_interval"]))
         self.auto_align_interval.grid(row=6, column=1, sticky="w")
@@ -1585,6 +1662,29 @@ class VosApp:
                 row=19, column=1, sticky="ew", pady=5)
         self.update_latency_overlay_position_labels()
 
+        randomizer = ttk.LabelFrame(alignment_tab, text="Movement timing and tolerance", padding=10)
+        randomizer.pack(fill="x", pady=(10, 0))
+        self.auto_align_randomize = tk.BooleanVar(value=bool(self.config["auto_align_randomize"]))
+        ttk.Checkbutton(randomizer, text="Use random ranges instead of fixed values", variable=self.auto_align_randomize,
+            command=self.on_auto_align_randomize_changed).grid(row=0, column=0, columnspan=2, sticky="w")
+        self.alignment_mode_note = tk.StringVar()
+        ttk.Label(randomizer, textvariable=self.alignment_mode_note, wraplength=490,
+            justify="left").grid(row=1, column=0, columnspan=2, sticky="w", pady=(3, 8))
+        for row, label, attr, key in (
+            (2, "Happy tolerance minimum (px):", "auto_align_random_tolerance_min", "auto_align_random_tolerance_min_pixels"),
+            (3, "Happy tolerance maximum (px):", "auto_align_random_tolerance_max", "auto_align_random_tolerance_max_pixels"),
+            (4, "Wait before each move minimum (s):", "auto_align_random_delay_min", "auto_align_random_delay_min_seconds"),
+            (5, "Wait before each move maximum (s):", "auto_align_random_delay_max", "auto_align_random_delay_max_seconds"),
+        ):
+            ttk.Label(randomizer, text=label).grid(row=row, column=0, sticky="w", pady=3)
+            entry = ttk.Entry(randomizer, width=14)
+            entry.insert(0, str(self.config[key]))
+            entry.grid(row=row, column=1, sticky="w")
+            setattr(self, attr, entry)
+        ttk.Label(randomizer, text="Crystal priority: contact is always within 5 px, in either mode.",
+            wraplength=490).grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self._update_alignment_mode_controls()
+
         settings = ttk.LabelFrame(general_tab, text="General / Arduino", padding=10)
         settings.pack(fill="x", pady=(10, 0))
         ttk.Label(settings, text="Master toggle hotkey:").grid(row=0, column=0, sticky="w")
@@ -1609,13 +1709,22 @@ class VosApp:
         self.vision_roi_padding.grid(row=5, column=1, sticky="w")
         ttk.Button(settings, text="Master On / Off", command=self.toggle_master).grid(row=6, column=0, pady=(8, 0), sticky="w")
 
-        self.log_view = tk.Text(logs, height=4, state="disabled", wrap="word")
+        self.log_notebook = ttk.Notebook(logs)
+        self.log_notebook.pack(fill="both", expand=True)
+        activity_tab = ttk.Frame(self.log_notebook)
+        diagnostics_tab = ttk.Frame(self.log_notebook)
+        self.log_notebook.add(activity_tab, text="Activity")
+        self.log_notebook.add(diagnostics_tab, text="Diagnostics")
+        self.log_view = tk.Text(activity_tab, height=4, state="disabled", wrap="word")
         self.log_view.pack(fill="both", expand=True)
+        self.diagnostic_log_view = tk.Text(diagnostics_tab, height=4, state="disabled", wrap="word")
+        self.diagnostic_log_view.pack(fill="both", expand=True)
+        self._last_log_text = {"activity": None, "diagnostics": None}
 
     def on_mousewheel(self, event):
         if not hasattr(self, "notebook"):
             return
-        if event.widget == self.log_view:
+        if event.widget in (self.log_view, self.diagnostic_log_view):
             return
         canvas = self.tab_canvases.get(self.notebook.select())
         delta = int(getattr(event, "delta", 0))
@@ -1661,9 +1770,20 @@ class VosApp:
         roi_padding = int(self.vision_roi_padding.get())
         if not 16 <= roi_padding <= 1000:
             raise ValueError("Moving-target ROI padding must be between 16 and 1000 pixels.")
-        auto_align_tolerance = int(self.auto_align_tolerance.get())
+        random_mode = bool(self.auto_align_randomize.get())
+        auto_align_tolerance = (int(self.config["auto_align_tolerance_pixels"]) if random_mode
+            else int(self.auto_align_tolerance.get()))
         auto_align_hold = float(self.auto_align_hold.get())
-        auto_align_interval = float(self.auto_align_interval.get())
+        auto_align_interval = (float(self.config["auto_align_interval"]) if random_mode
+            else float(self.auto_align_interval.get()))
+        random_tolerance_min = (int(self.auto_align_random_tolerance_min.get()) if random_mode
+            else int(self.config["auto_align_random_tolerance_min_pixels"]))
+        random_tolerance_max = (int(self.auto_align_random_tolerance_max.get()) if random_mode
+            else int(self.config["auto_align_random_tolerance_max_pixels"]))
+        random_delay_min = (float(self.auto_align_random_delay_min.get()) if random_mode
+            else float(self.config["auto_align_random_delay_min_seconds"]))
+        random_delay_max = (float(self.auto_align_random_delay_max.get()) if random_mode
+            else float(self.config["auto_align_random_delay_max_seconds"]))
         yeti_rate = float(self.yeti_check_rate.get())
         yeti_threshold = float(self.yeti_threshold.get())
         yeti_band_padding = int(self.yeti_band_padding.get())
@@ -1690,6 +1810,10 @@ class VosApp:
             raise ValueError("Movement key hold must be between 0.001 and 1 second.")
         if not 0.02 <= auto_align_interval <= 5.0:
             raise ValueError("Correction interval must be between 0.02 and 5 seconds.")
+        if not 0 <= random_tolerance_min <= random_tolerance_max <= 500:
+            raise ValueError("Random happy tolerance must be 0–500 px, with min no greater than max.")
+        if not 0 <= random_delay_min <= random_delay_max <= 30:
+            raise ValueError("Random move delay must be 0–30 seconds, with min no greater than max.")
         if not 1 <= yeti_rate <= 100:
             raise ValueError("Yeti checks per second must be between 1 and 100.")
         if not 0.5 <= yeti_threshold <= 0.9999:
@@ -1733,6 +1857,11 @@ class VosApp:
             "auto_align_tolerance_pixels": auto_align_tolerance,
             "auto_align_key_hold": auto_align_hold,
             "auto_align_interval": auto_align_interval,
+            "auto_align_randomize": bool(self.auto_align_randomize.get()),
+            "auto_align_random_tolerance_min_pixels": random_tolerance_min,
+            "auto_align_random_tolerance_max_pixels": random_tolerance_max,
+            "auto_align_random_delay_min_seconds": random_delay_min,
+            "auto_align_random_delay_max_seconds": random_delay_max,
             "show_spammer_overlay": bool(self.show_spammer_overlay.get()),
             "show_latency_overlay": bool(self.show_latency_overlay.get()),
             "latency_overlay_x_percent": int(self.latency_overlay_x.get()),
@@ -1810,7 +1939,7 @@ class VosApp:
             self.hotkey_handles.append(keyboard.add_hotkey(
                 self.config["shop_test_key"], lambda: self.ui_actions.put("shop_test"),
                 suppress=False))
-            log(f"Hotkeys bound: master={self.config['toggle_key']}, VoS={self.config['vos_toggle_key']}, shop test={self.config['shop_test_key']}")
+            log(f"Hotkeys bound: master={self.config['toggle_key']}, VoS={self.config['vos_toggle_key']}, shop test={self.config['shop_test_key']}", diagnostic=True)
         except Exception as exc:
             for handle in self.hotkey_handles:
                 try:
@@ -1882,7 +2011,7 @@ class VosApp:
         if not enabled:
             self.spam_paused_reason = None
         save_config(self.config)
-        log(f"Yeti/Crown-required spam gate {'enabled' if enabled else 'disabled'}")
+        log(f"Yeti/Crown-required spam gate {'enabled' if enabled else 'disabled'}", diagnostic=True)
 
     def on_monster_area_changed(self):
         manual = bool(self.monster_area_manual.get())
@@ -1891,7 +2020,7 @@ class VosApp:
         self.config["show_monster_area"] = shown
         save_config(self.config)
         log(f"Monster search area: {'manual' if manual else 'automatic'}, "
-            f"guide {'shown' if shown else 'hidden'}")
+            f"guide {'shown' if shown else 'hidden'}", diagnostic=True)
 
     def update_monster_band_labels(self):
         self.monster_top_label.configure(
@@ -1935,34 +2064,70 @@ class VosApp:
         if enabled and self.spam_active and not self.shop_controller.test_cycle and not self.map_detector.allows_spam():
             self.spam_paused_reason = "Waiting for map"
         save_config(self.config)
-        log(f"VoS Map Checker {'enabled' if enabled else 'disabled'}")
+        log(f"VoS Map Checker {'enabled' if enabled else 'disabled'}", diagnostic=True)
 
     def on_alignment_changed(self):
         enabled = bool(self.alignment_enabled.get())
         self.config["alignment_overlay_enabled"] = enabled
         save_config(self.config)
-        log(f"Alignment overlay {'enabled' if enabled else 'disabled'}")
+        log(f"Alignment overlay {'enabled' if enabled else 'disabled'}", diagnostic=True)
 
     def on_auto_align_changed(self):
         enabled = bool(self.auto_align_enabled.get())
         self.config["auto_align_enabled"] = enabled
+        self._reset_alignment_randomizer()
         if not enabled:
             self.auto_align_direction = "Off"
             self.auto_align_delta = None
+            self.alignment_move_pending = False
+            if self.spam_paused_reason == "Moving":
+                self.spam_paused_reason = None
         save_config(self.config)
         log(f"Auto alignment {'enabled' if enabled else 'disabled'}")
+
+    def _reset_alignment_randomizer(self):
+        self.auto_align_move_order = None
+        self.auto_align_random_tolerance = None
+        self.auto_align_order_target = None
+        self.auto_align_last_move_check = 0.0
+        self.auto_align_correction_active = False
+
+    def _update_alignment_mode_controls(self):
+        random_mode = bool(self.auto_align_randomize.get())
+        fixed_state = "disabled" if random_mode else "normal"
+        random_state = "normal" if random_mode else "disabled"
+        for entry in (self.auto_align_tolerance, self.auto_align_interval):
+            entry.configure(state=fixed_state)
+        for entry in (self.auto_align_random_tolerance_min, self.auto_align_random_tolerance_max,
+                      self.auto_align_random_delay_min, self.auto_align_random_delay_max):
+            entry.configure(state=random_state)
+        self.alignment_mode_note.set(
+            "Random mode: each correction picks a new tolerance and wait from the ranges below. "
+            "Spam continues during the wait, then pauses while moving until aligned. "
+            "Save Settings to apply edited ranges."
+            if random_mode else
+            "Fixed mode: use the happy tolerance and correction interval above. "
+            "Random ranges are saved but inactive until enabled."
+        )
+
+    def on_auto_align_randomize_changed(self):
+        self.config["auto_align_randomize"] = bool(self.auto_align_randomize.get())
+        self._reset_alignment_randomizer()
+        self._update_alignment_mode_controls()
+        save_config(self.config)
+        log(f"Alignment move randomizer {'enabled' if self.config['auto_align_randomize'] else 'disabled'}", diagnostic=True)
 
     def on_spammer_overlay_changed(self):
         enabled = bool(self.show_spammer_overlay.get())
         self.config["show_spammer_overlay"] = enabled
         save_config(self.config)
-        log(f"In-game spammer badge {'enabled' if enabled else 'disabled'}")
+        log(f"In-game spammer badge {'enabled' if enabled else 'disabled'}", diagnostic=True)
 
     def on_latency_overlay_changed(self):
         enabled = bool(self.show_latency_overlay.get())
         self.config["show_latency_overlay"] = enabled
         save_config(self.config)
-        log(f"In-game latency badge {'enabled' if enabled else 'disabled'}")
+        log(f"In-game latency badge {'enabled' if enabled else 'disabled'}", diagnostic=True)
 
     def update_latency_overlay_position_labels(self):
         self.latency_overlay_x_label.configure(text=f"Latency badge horizontal: {self.latency_overlay_x.get()}%")
@@ -2014,7 +2179,7 @@ class VosApp:
         if not enabled and self.alignment_overlay is not None:
             self.alignment_overlay.clear_crystal()
         save_config(self.config)
-        log(f"Crystal guide {'enabled' if enabled else 'disabled'}")
+        log(f"Crystal guide {'enabled' if enabled else 'disabled'}", diagnostic=True)
 
     def on_loot_crystal_changed(self):
         enabled = bool(self.loot_crystal.get())
@@ -2023,7 +2188,7 @@ class VosApp:
             self.show_crystal.set(True)
             self.config["show_crystal"] = True
         save_config(self.config)
-        log(f"Loot crystal priority {'enabled' if enabled else 'disabled'}")
+        log(f"Loot crystal priority {'enabled' if enabled else 'disabled'}", diagnostic=True)
 
     def on_alignment_target_changed(self):
         mode = self.alignment_target_mode.get()
@@ -2066,23 +2231,31 @@ class VosApp:
         while not self.auto_align_stop.is_set():
             interval = max(0.02, float(self.config.get("auto_align_interval", 0.10)))
             if not self.config.get("auto_align_enabled", False):
+                self._reset_alignment_randomizer()
                 self.auto_align_direction = "Off"
                 self.auto_align_delta = None
+                self.alignment_move_pending = False
+                if self.spam_paused_reason == "Moving":
+                    self.spam_paused_reason = None
                 self.auto_align_stop.wait(0.10)
                 continue
             if not self.spam_active:
+                self._reset_alignment_randomizer()
                 self.auto_align_direction = "Waiting for VoS"
                 self.auto_align_delta = None
+                self.alignment_move_pending = False
                 self.auto_align_stop.wait(0.10)
                 continue
             if self.shop_controller.state != "idle":
+                self._reset_alignment_randomizer()
                 self.auto_align_direction = "Selling"
                 self.auto_align_stop.wait(.1)
                 continue
             # The Yeti/Crown gate controls only skill spam. Movement alignment should
             # continue while waiting for either template. Other maintenance pauses,
             # such as casting/recovering Thorns, still pause movement.
-            if self.spam_paused_reason and self.spam_paused_reason != "Waiting for Yeti/Crown":
+            if self.spam_paused_reason and self.spam_paused_reason not in ("Waiting for Yeti/Crown", "Moving"):
+                self._reset_alignment_randomizer()
                 self.auto_align_direction = self.spam_paused_reason
                 self.auto_align_delta = None
                 self.auto_align_stop.wait(0.10)
@@ -2098,13 +2271,14 @@ class VosApp:
                 checked,
                 crystal,
                 _,
-                _,
+                crystal_generation,
             ) = self.alignment_overlay.snapshot()
             detector_rate = max(1.0, float(self.config.get("alignment_checks_per_second", 10)))
             if (
                 bulb is None
                 or time.monotonic() - checked > max(0.5, 3.0 / detector_rate)
             ):
+                self.auto_align_move_order = None
                 self.auto_align_direction = "Waiting for character marker"
                 self.auto_align_delta = None
                 self.auto_align_stop.wait(interval)
@@ -2126,33 +2300,110 @@ class VosApp:
                 target_name = "Area"
                 target_x = area[0] + area[2] / 2.0
             else:
+                self.auto_align_move_order = None
                 self.auto_align_direction = "Waiting for area marker"
                 self.auto_align_delta = None
                 self.auto_align_stop.wait(interval)
                 continue
 
             delta = character_x - target_x
-            tolerance = max(0, int(self.config.get("auto_align_tolerance_pixels", 8)))
+            randomize = bool(self.config.get("auto_align_randomize", False))
+            # Track the object, not its exact x coordinate: moving/jittering
+            # matches should not restart a queued wait every frame.
+            target_id = (target_name, crystal_generation if loot_pending else
+                round(target_x, 1) if target_name == "Manual anchor" else None)
+            if randomize and target_id != self.auto_align_order_target:
+                was_moving_to_area = self.auto_align_correction_active and loot_pending
+                self._reset_alignment_randomizer()
+                self.auto_align_order_target = target_id
+                if was_moving_to_area:
+                    # A new crystal interrupts an active area correction.
+                    self.auto_align_correction_active = True
+            if randomize and self.auto_align_random_tolerance is None:
+                self.auto_align_random_tolerance = random.randint(
+                    int(self.config["auto_align_random_tolerance_min_pixels"]),
+                    int(self.config["auto_align_random_tolerance_max_pixels"]))
+            # Reaching the crystal's line is stricter than the ordinary happy
+            # tolerance, which may be deliberately wide or randomized.
+            tolerance = (5 if loot_pending else self.auto_align_random_tolerance if randomize else
+                max(0, int(self.config.get("auto_align_tolerance_pixels", 8))))
             self.auto_align_delta = delta
             if abs(delta) <= tolerance:
+                self.auto_align_move_order = None
+                self.auto_align_correction_active = False
                 if loot_pending:
-                    self.auto_align_direction = "Crystal reached; waiting for pickup"
+                    self.alignment_overlay.touch_crystal(crystal_generation, crystal)
+                self.alignment_move_pending = False
+                if self.spam_paused_reason == "Moving":
+                    self.spam_paused_reason = None
+                if loot_pending:
+                    self.auto_align_direction = "Crystal line reached"
                 else:
                     self.auto_align_direction = "Aligned"
                 self.auto_align_stop.wait(interval)
                 continue
 
+            if randomize:
+                # The delay applies only before the first movement of a
+                # correction episode. Skill spam continues during preparation.
+                if not self.auto_align_correction_active and self.auto_align_move_order is None:
+                    if checked <= self.auto_align_last_move_check:
+                        self.auto_align_direction = "Waiting for fresh character position"
+                        self.auto_align_stop.wait(.05)
+                        continue
+                    order = sample_alignment_move_order(self.config, time.monotonic(), target_id)
+                    self.auto_align_move_order = order
+                    self.auto_align_random_tolerance = order.tolerance_pixels
+                    if abs(delta) <= (5 if loot_pending else order.tolerance_pixels):
+                        self.auto_align_move_order = None
+                        self.alignment_move_pending = False
+                        if self.spam_paused_reason == "Moving":
+                            self.spam_paused_reason = None
+                        self.auto_align_direction = "Aligned"
+                        self.auto_align_stop.wait(.05)
+                        continue
+                if not self.auto_align_correction_active:
+                    remaining = self.auto_align_move_order.ready_at - time.monotonic()
+                    if remaining > 0:
+                        self.alignment_move_pending = False
+                        if self.spam_paused_reason == "Moving":
+                            self.spam_paused_reason = None
+                        self.auto_align_direction = f"Move queued in {remaining:.1f}s; spamming ({target_name})"
+                        self.auto_align_stop.wait(min(.05, remaining))
+                        continue
+                elif checked <= self.auto_align_last_move_check:
+                    self.auto_align_direction = f"Moving; waiting for fresh position ({target_name})"
+                    self.auto_align_stop.wait(.05)
+                    continue
+
             direction = "RIGHT" if delta < 0 else "LEFT"
             hold = max(0.001, float(self.config.get("auto_align_key_hold", 0.03)))
-            if self.config.get("use_arduino", True):
-                sent = ARDUINO.send_command(self.config, direction, hold)
-            else:
-                send_windows_direction(direction, hold)
-                sent = True
+            with self.input_lock:
+                can_move = (self.config.get("auto_align_enabled", False)
+                    and self.spam_active and self.shop_controller.state == "idle"
+                    and self.spam_paused_reason in (None, "Moving", "Waiting for Yeti/Crown"))
+                if not can_move:
+                    sent = None
+                else:
+                    self.alignment_move_pending = True
+                    self.spam_paused_reason = "Moving"
+                    if self.config.get("use_arduino", True):
+                        sent = ARDUINO.send_command(self.config, direction, hold)
+                    else:
+                        send_windows_direction(direction, hold)
+                        sent = True
+
+            if sent is None:
+                self.auto_align_stop.wait(min(interval, .1))
+                continue
 
             if sent:
-                self.auto_align_direction = f"{target_name} {direction}"
+                self.auto_align_direction = f"Moving {direction} ({target_name})"
                 self.auto_align_move_count += 1
+                if randomize:
+                    self.auto_align_correction_active = True
+                    self.auto_align_last_move_check = checked
+                    self.auto_align_move_order = None
             else:
                 self.auto_align_direction = "Arduino send failed"
             self.auto_align_stop.wait(interval)
@@ -2185,9 +2436,12 @@ class VosApp:
             log("VoS did not start: DreamMS.exe is not the active window")
             return
         self.stop_event.clear()
+        self._reset_alignment_randomizer()
         self.send_count = 0
         waiting_for_map = not self.map_detector.allows_spam()
-        self.spam_paused_reason = "Waiting for map" if waiting_for_map else None
+        self.alignment_move_pending = bool(self.config.get("auto_align_enabled", False))
+        self.spam_paused_reason = ("Waiting for map" if waiting_for_map else
+            "Moving" if self.alignment_move_pending else None)
         self.buff_resume_not_before = 0.0
         self.spam_active = True
         self.worker = threading.Thread(target=self._spam_loop, name="vos-spam", daemon=True)
@@ -2195,11 +2449,13 @@ class VosApp:
         log(f"VoS spam ON ({self.config['vos_output_key']})" + ("; waiting for map" if waiting_for_map else ""))
 
     def stop_vos(self, reason="stopped"):
+        self._reset_alignment_randomizer()
         self.shop_controller.reset()
         was_active = self.spam_active
         self.stop_event.set()
         self.spam_active = False
         self.spam_paused_reason = None
+        self.alignment_move_pending = False
         self.buff_resume_not_before = 0.0
         if was_active:
             log(f"VoS spam OFF ({reason})")
@@ -2253,19 +2509,34 @@ class VosApp:
                     if self.stop_event.wait(min(0.05, max(0.001, wait_seconds))):
                         break
                     continue
+            if self.config.get("auto_align_enabled", False) and self.alignment_move_pending:
+                self.spam_paused_reason = "Moving"
+                if self.stop_event.wait(.05):
+                    break
+                continue
             if not self.yeti_detector.allows_spam():
                 self.spam_paused_reason = "Waiting for Yeti/Crown"
                 if self.stop_event.wait(0.05):
                     break
                 continue
-            self.spam_paused_reason = None
-            if config.get("use_arduino", True):
-                if not ARDUINO.send_key(config, key, hold):
-                    log("VoS stopped: Arduino send failed")
-                    self.stop_vos("Arduino disconnected")
-                    return
-            else:
-                send_windows_key(key, hold)
+            with self.input_lock:
+                moving = bool(self.config.get("auto_align_enabled", False) and self.alignment_move_pending)
+                if not moving:
+                    self.spam_paused_reason = None
+                    if config.get("use_arduino", True):
+                        sent = ARDUINO.send_key(config, key, hold)
+                    else:
+                        send_windows_key(key, hold)
+                        sent = True
+            if moving:
+                self.spam_paused_reason = "Moving"
+                if self.stop_event.wait(.05):
+                    break
+                continue
+            if not sent:
+                log("VoS stopped: Arduino send failed")
+                self.stop_vos("Arduino disconnected")
+                return
             self.send_count += 1
             if self.stop_event.wait(interval):
                 break
@@ -2382,11 +2653,18 @@ class VosApp:
             arduino_text, color = "Disconnected", "red"
         self.arduino_status.configure(text=arduino_text, foreground=color)
 
-        self.log_view.configure(state="normal")
-        self.log_view.delete("1.0", tk.END)
-        self.log_view.insert(tk.END, "\n".join(LOG_BUFFER))
-        self.log_view.see(tk.END)
-        self.log_view.configure(state="disabled")
+        for name, view, buffer in (
+            ("activity", self.log_view, LOG_BUFFER),
+            ("diagnostics", self.diagnostic_log_view, DIAGNOSTIC_LOG_BUFFER),
+        ):
+            content = "\n".join(buffer)
+            if content != self._last_log_text[name]:
+                view.configure(state="normal")
+                view.delete("1.0", tk.END)
+                view.insert(tk.END, content)
+                view.see(tk.END)
+                view.configure(state="disabled")
+                self._last_log_text[name] = content
         self.root.after(500, self.refresh_status)
 
     def on_close(self):

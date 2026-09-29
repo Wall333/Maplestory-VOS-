@@ -1,4 +1,8 @@
-# Maplestory VOS v2
+# Maplestory VOS
+
+Current release: **2.1.0**. See [CHANGELOG.md](CHANGELOG.md) for the release
+summary. This repository contains the full Python source, image assets,
+Arduino/Teensy firmware, tests, and a self-contained Windows release ZIP.
 
 A separate Windows helper that repeatedly sends a selected key while
 `DreamMS.exe` is the foreground window. Available spam keys are `End`,
@@ -6,18 +10,21 @@ A separate Windows helper that repeatedly sends a selected key while
 
 ## Current packaged defaults
 
-- Spam `Y` every 2 seconds.
+- Spam `F` every 2 seconds.
 - Manual green anchor at the horizontal center (`0px`).
-- Auto-align enabled with 200px tolerance, 0.5s hold, and 0.5s interval.
+- Auto-align enabled with a 0.4s movement hold. Random mode is on by default:
+  50–200px happy tolerance and a 2–10s pre-move wait while spam continues.
+  Fixed-mode values (when random mode is off) are 200px tolerance and a 0.5s
+  correction interval.
 - Crystal display/looting, Yeti-required spam, and Thorns maintenance enabled.
-- Map threshold `0.60`; alignment threshold `0.70`; Yeti threshold `0.80`; Thorns threshold `0.50`.
+- Map threshold `0.60`; alignment threshold `0.70`; Yeti threshold `0.70`; Thorns threshold `0.50`.
 - Automatic Yeti vertical band (120 px padding; full reacquisition every 2 seconds).
 - Spam badge at horizontal `85%`, vertical `4%`; latency badge at `20%`, `5%`.
 
 ## Portable Windows package
 
-Download `Maplestory-VOS-v2-Windows-x64.zip`, extract the **entire** archive,
-and run `Maplestory-VOS-v2.exe`. It includes Python and the required desktop
+Download `Maplestory-VOS-v2.1.0-Windows-x64.zip` from the GitHub release,
+extract the **entire** archive, and run `Maplestory-VOS.exe`. It includes Python and the required desktop
 libraries; the other files and `_internal` directory must stay beside the EXE.
 Settings and logs are written beside the EXE, so extract to a writable folder
 (not `Program Files`). The Arduino/Teensy firmware still needs to be flashed to
@@ -40,7 +47,7 @@ Logs at the bottom, and
 groups feature controls into Spam, Alignment, Shop, Buff / Map, and General
 tabs. Save after editing entry fields or selecting the character marker;
 smaller windows can still scroll within each tab. Tabs are left-aligned. Drag
-the divider above Recent logs to resize the log area, then click **Save settings**
+the divider above Logs to resize the log area, then click **Save settings**
 to remember its height for the next launch.
 
 The spam loop stops automatically if DreamMS loses focus. Turning off Arduino
@@ -113,15 +120,39 @@ The visual guide and auto-alignment use the same selected target.
 Auto alignment can optionally use those two center lines while VoS spam is
 running. Inside the configured pixel tolerance it does nothing; outside the
 tolerance it taps `LEFT` or `RIGHT` through the selected Arduino/Windows input
-path. Movement key hold and correction interval should be tuned conservatively
-to avoid overshooting the target.
+path. Skill spam pauses with a **Moving** status while the character is outside
+the allowed tolerance, then resumes after a fresh tracker result confirms it
+is back inside. Movement key hold and correction interval should be tuned
+conservatively to avoid overshooting the target.
+
+The optional **Movement randomizer** on the Alignment tab replaces the fixed
+happy tolerance and correction interval with per-move ranges. Set minimum and
+maximum tolerance in pixels and minimum and maximum wait in seconds, then save.
+The GUI disables whichever set of numeric controls is inactive so it is clear
+which values apply; movement key hold applies in both modes.
+For each correction, the bot chooses one value from each range and keeps skill
+spam running during the randomized wait. Once the wait expires, it checks the
+latest tracked position; if still outside tolerance, it pauses spam with
+**Moving** and keeps correcting without another randomized wait until aligned.
+If the character reaches tolerance during preparation, the queued move is
+cancelled. Leave the randomizer off to retain the fixed tolerance/interval
+behavior.
 
 The in-game overlay can show a large live `SPAMMER ON/OFF` badge. Enabling
 **Show crystal** detects `assets/crystal.png` and draws a red vertical guide
 while the crystal remains visible. With **Loot crystal** enabled,
-auto-alignment prioritizes that red line and holds within tolerance until the
-crystal disappears; the guide is then cleared and alignment returns to the
-normal area target.
+auto-alignment prioritizes that red line, even during a pending randomized
+move. Crystal contact uses a tight 5 px threshold instead of the normal happy
+tolerance. Once the character reaches the line, that crystal's red guide is
+retired and alignment returns to the normal target, even if the crystal image
+remains visible because it cannot be looted. The same crystal is ignored until
+it disappears for several checks; a newly appearing crystal can be targeted.
+
+The resizable log area has two tabs: **Activity** for start/stop, shop/selling,
+buff actions, and errors; **Diagnostics** for detector changes, template match
+scores, and vision performance summaries. The corresponding text files are
+`activity_logs.txt` and `diagnostic_logs.txt` beside `config.json`.
+`recent_logs.txt` still contains the combined history for compatibility.
 
 The spam status overlay can be shown or hidden independently. Horizontal and
 vertical position sliders move it live using percentages of the DreamMS client,

@@ -50,6 +50,7 @@ class ShopController:
         for name in names:
             if name not in vision.templates:
                 self.status = "Missing " + name + ".png"
+                self.api["log"]("Shop detector unavailable: " + self.status)
                 return
         self.templates = {name: vision.templates[name] for name in names}
         sequence, next_check = 0, 0.0
@@ -154,6 +155,7 @@ class ShopController:
                 vision.record("frame_age.shop", time.monotonic() - packet.captured_at)
         except Exception as exc:
             self.status = "Detector error: " + str(exc)
+            self.api["log"]("Shop detector error: " + str(exc))
 
 
     def click(self, rect, context):
