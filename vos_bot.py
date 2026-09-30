@@ -12,6 +12,7 @@ from collections import deque
 import tkinter as tk
 from tkinter import messagebox, ttk
 from shop_controller import ShopController
+from minimap_detector import MinimapDetector
 from vision_runtime import VisionRuntime, vertical_band_from_center
 
 try:
@@ -69,6 +70,10 @@ DEFAULTS = {
     "vos_map_checker_enabled": True,
     "vos_map_checks_per_second": 10,
     "vos_map_match_threshold": 0.60,
+    "minimap_checker_enabled": True,
+    "minimap_debug_overlay": False,
+    "minimap_checks_per_second": 5,
+    "minimap_match_threshold": 0.90,
     "alignment_overlay_enabled": True,
     "alignment_checks_per_second": 10,
     "alignment_match_threshold": 0.70,
@@ -78,6 +83,9 @@ DEFAULTS = {
     "log_panel_height": 154,
     "alignment_target_mode": "manual",
     "manual_anchor_offset": -22,
+    "side_anchor_left_percent": 0,
+    "side_anchor_right_percent": 100,
+    "show_side_anchors": True,
     "auto_align_enabled": True,
     "auto_align_tolerance_pixels": 200,
     "auto_align_key_hold": 0.4,
@@ -163,6 +171,19 @@ def sample_alignment_move_order(config, now, target_id, rng=random):
     delay_max = max(delay_min, float(config.get("auto_align_random_delay_max_seconds", .75)))
     delay = max(delay_min, min(delay_max, rng.uniform(delay_min, delay_max)))
     return AlignmentMoveOrder(target_id, rng.randint(tolerance_min, tolerance_max), delay, now + delay)
+
+
+def side_anchor_bounds(config, client_width):
+    """Return inclusive client-relative x limits for character alignment."""
+    max_x = max(0, int(client_width) - 1)
+    left_percent = max(0, min(100, int(config.get("side_anchor_left_percent", 0))))
+    right_percent = max(left_percent, min(100, int(config.get("side_anchor_right_percent", 100))))
+    return round(max_x * left_percent / 100), round(max_x * right_percent / 100)
+
+
+def alignment_goal_met(character_x, target_x, tolerance, left_limit, right_limit):
+    return (abs(character_x - target_x) <= tolerance
+        and left_limit - 5 <= character_x <= right_limit + 5)
 
 
 def load_config():
@@ -803,7 +824,7 @@ class AlignmentOverlay:
             self.crystal_match = None
             self.crystal_score = 0.0
             self.crystal_visible = False
-            log(f"Crystal line reached at x={current_x:.1f}; guide retired until crystal disappears")
+            log(f"Crystal target satisfied at x={current_x:.1f}; guide retired until crystal disappears")
             return True
 
     def _update_crystal(self, match, score, rate):
@@ -1019,8 +1040,11 @@ class AlignmentOverlay:
         yeti_rects, yeti_checked = self.app.yeti_detector.overlay_rects()
         show_yeti = bool(self.app.config.get("show_yeti_overlay", False))
         show_monster_area = bool(self.app.config.get("show_monster_area", False))
+        minimap_rect, _, minimap_reds, minimap_player, _, minimap_checked = self.app.minimap_detector.snapshot()
+        show_minimap = bool(self.app.config.get("minimap_debug_overlay", False)
+                            and minimap_rect is not None and time.monotonic() - minimap_checked <= 1.0)
         if bbox is None or not (
-            guides_enabled or show_spammer or show_latency or (show_crystal and crystal is not None) or show_thorns or show_inventory or show_yeti or show_monster_area
+            guides_enabled or show_spammer or show_latency or (show_crystal and crystal is not None) or show_thorns or show_inventory or show_yeti or show_monster_area or show_minimap
         ):
             self.window.withdraw()
         else:
@@ -1029,6 +1053,20 @@ class AlignmentOverlay:
             self.window.geometry(f"{width}x{height}+{left}+{top}")
             self.canvas.configure(width=width, height=height)
             self.canvas.delete("all")
+            if show_minimap:
+                mx, my, mw, mh = minimap_rect
+                self.canvas.create_rectangle(mx, my, mx + mw, my + mh,
+                                             outline="#00e5ff", width=2)
+                for rx, ry, rw, rh in minimap_reds:
+                    self.canvas.create_rectangle(rx - 2, ry - 2, rx + rw + 2, ry + rh + 2,
+                                                 outline="#ff3030", width=2)
+                if minimap_player is not None:
+                    px, py, pw, ph = minimap_player
+                    self.canvas.create_rectangle(px - 2, py - 2, px + pw + 2, py + ph + 2,
+                                                 outline="#ffe600", width=2)
+                self.canvas.create_text(mx, max(4, my - 17),
+                                        text=f"MINIMAP: {len(minimap_reds)} other marker(s)",
+                                        fill="#00e5ff", anchor="nw", font=("Segoe UI", 9, "bold"))
             if show_monster_area:
                 band = self.app.yeti_detector.search_band_snapshot(height, self.app.vision.frame.context)
                 if band is not None:
@@ -1069,6 +1107,17 @@ class AlignmentOverlay:
                 self.canvas.create_line(center_x, 0, center_x, height, fill="#39ff14", width=2, dash=(8, 5))
                 self.canvas.create_oval(center_x - 5, center_y - 5, center_x + 5, center_y + 5, outline="#39ff14", width=2)
                 self.canvas.create_text(center_x + 8, max(10, center_y - 10), text=target_label, fill="#39ff14", anchor="w")
+
+            if guides_enabled and self.app.config.get("show_side_anchors", True):
+                left_limit, right_limit = side_anchor_bounds(self.app.config, width)
+                for limit_x, label, anchor, label_x in (
+                    (left_limit, "LEFT LIMIT", "nw", min(width - 1, left_limit + 6)),
+                    (right_limit, "RIGHT LIMIT", "ne", max(0, right_limit - 6)),
+                ):
+                    self.canvas.create_line(limit_x, 0, limit_x, height,
+                        fill="#ffab32", width=2, dash=(5, 5))
+                    self.canvas.create_text(label_x, 24, text=label, fill="#ffab32",
+                        font=("Segoe UI", 9, "bold"), anchor=anchor)
 
             if guides_enabled and bulb is not None:
                 x, y, w, h = bulb
@@ -1216,6 +1265,7 @@ class VosApp:
             lambda message: log(message, diagnostic=message.startswith("Vision perf")))
         log(f"Vision workers=3 general + 1 dedicated character; OpenCV internal threads={cv2.getNumThreads()}", diagnostic=True)
         self.map_detector = VosMapDetector(self)
+        self.minimap_detector = MinimapDetector(self, log)
         self.yeti_detector = YetiDetector(self)
         self.thorns_detector = ThornsDetector(self)
         self.shop_controller = ShopController(self, globals())
@@ -1232,6 +1282,7 @@ class VosApp:
         self.auto_align_correction_active = False
         self.auto_align_move_count = 0
         self._anchor_save_job = None
+        self._side_anchor_save_job = None
         self._monster_area_save_job = None
         self._overlay_position_save_job = None
         self.vision_overlay_lines = ("VISION -- FPS", "CAP -- ms | CHAR -- ms", "FRAME AGE -- ms")
@@ -1244,6 +1295,7 @@ class VosApp:
         self.alignment_overlay = AlignmentOverlay(self)
         self.vision.start()
         self.map_detector.start()
+        self.minimap_detector.start()
         self.yeti_detector.start()
         self.thorns_detector.start()
         self.shop_controller.start()
@@ -1303,6 +1355,7 @@ class VosApp:
         shop_tab = self._add_settings_tab("Shop")
         checks_tab = self._add_settings_tab("Buff / Map")
         general_tab = self._add_settings_tab("General")
+        minimap_tab = self._add_settings_tab("Minimap")
         self.root.bind("<MouseWheel>", self.on_mousewheel)
 
         ttk.Label(status, text="DreamMS window:").grid(row=0, column=0, sticky="w")
@@ -1338,6 +1391,31 @@ class VosApp:
         ttk.Label(status, text="Character latency:").grid(row=10, column=0, sticky="w")
         self.character_perf_status = ttk.Label(status, text="Waiting for tracking")
         self.character_perf_status.grid(row=10, column=1, sticky="w", padx=10)
+        ttk.Label(status, text="Other players (minimap):").grid(row=11, column=0, sticky="w")
+        self.minimap_status = ttk.Label(status, text="Starting...")
+        self.minimap_status.grid(row=11, column=1, sticky="w", padx=10)
+
+        minimap_settings = ttk.LabelFrame(minimap_tab, text="Minimap markers", padding=10)
+        minimap_settings.pack(fill="x", pady=10)
+        self.minimap_checker_enabled = tk.BooleanVar(value=bool(self.config["minimap_checker_enabled"]))
+        self.minimap_debug_overlay = tk.BooleanVar(value=bool(self.config["minimap_debug_overlay"]))
+        def update_minimap_options():
+            self.config["minimap_checker_enabled"] = self.minimap_checker_enabled.get()
+            self.config["minimap_debug_overlay"] = self.minimap_debug_overlay.get()
+            save_config(self.config)
+        ttk.Checkbutton(minimap_settings, text="Detect red (other player) and yellow (you) markers",
+                        variable=self.minimap_checker_enabled, command=update_minimap_options).pack(anchor="w")
+        ttk.Checkbutton(minimap_settings, text="Show minimap and marker debug boxes in game",
+                        variable=self.minimap_debug_overlay, command=update_minimap_options).pack(anchor="w")
+        ttk.Label(minimap_settings, text="Checks per second:").pack(anchor="w", pady=(8, 0))
+        self.minimap_check_rate = ttk.Entry(minimap_settings, width=14)
+        self.minimap_check_rate.insert(0, str(self.config["minimap_checks_per_second"]))
+        self.minimap_check_rate.pack(anchor="w")
+        ttk.Label(minimap_settings, text="Minimap match threshold:").pack(anchor="w", pady=(8, 0))
+        self.minimap_threshold = ttk.Entry(minimap_settings, width=14)
+        self.minimap_threshold.insert(0, str(self.config["minimap_match_threshold"]))
+        self.minimap_threshold.pack(anchor="w")
+        ttk.Label(minimap_settings, text="Informational only; does not pause or control VoS.").pack(anchor="w", pady=(8, 0))
 
         shop = ttk.LabelFrame(shop_tab, text="Inventory / Selling", padding=10)
         shop.pack(fill="x", pady=10)
@@ -1662,6 +1740,33 @@ class VosApp:
                 row=19, column=1, sticky="ew", pady=5)
         self.update_latency_overlay_position_labels()
 
+        side_anchors = ttk.LabelFrame(alignment_tab, text="Side anchors / character travel limits", padding=10)
+        side_anchors.pack(fill="x", pady=(10, 0))
+        ttk.Label(side_anchors, text=(
+            "Orange lines mark the left/right limits. A crystal beyond a line is "
+            "treated as reached when the character reaches that limit."),
+            wraplength=490, justify="left").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        self.show_side_anchors = tk.BooleanVar(value=bool(self.config.get("show_side_anchors", True)))
+        ttk.Checkbutton(side_anchors, text="Show side anchor lines in alignment overlay",
+            variable=self.show_side_anchors, command=self.on_show_side_anchors_changed).grid(
+                row=1, column=0, columnspan=2, sticky="w", pady=(0, 5))
+        self.side_anchor_left = tk.IntVar(value=int(self.config.get("side_anchor_left_percent", 0)))
+        self.side_anchor_right = tk.IntVar(value=int(self.config.get("side_anchor_right_percent", 100)))
+        self.side_anchor_left_label = ttk.Label(side_anchors)
+        self.side_anchor_left_label.grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Scale(side_anchors, from_=0, to=99, orient="horizontal",
+            variable=self.side_anchor_left,
+            command=lambda value: self.on_side_anchor_moved("left", value)).grid(
+                row=2, column=1, sticky="ew", pady=4)
+        self.side_anchor_right_label = ttk.Label(side_anchors)
+        self.side_anchor_right_label.grid(row=3, column=0, sticky="w", pady=4)
+        ttk.Scale(side_anchors, from_=1, to=100, orient="horizontal",
+            variable=self.side_anchor_right,
+            command=lambda value: self.on_side_anchor_moved("right", value)).grid(
+                row=3, column=1, sticky="ew", pady=4)
+        side_anchors.columnconfigure(1, weight=1)
+        self.update_side_anchor_labels()
+
         randomizer = ttk.LabelFrame(alignment_tab, text="Movement timing and tolerance", padding=10)
         randomizer.pack(fill="x", pady=(10, 0))
         self.auto_align_randomize = tk.BooleanVar(value=bool(self.config["auto_align_randomize"]))
@@ -1759,6 +1864,8 @@ class VosApp:
         baud = int(self.baud_rate.get())
         check_rate = float(self.map_check_rate.get())
         threshold = float(self.map_threshold.get())
+        minimap_rate = float(self.minimap_check_rate.get())
+        minimap_threshold = float(self.minimap_threshold.get())
         alignment_rate = float(self.alignment_rate.get())
         alignment_threshold = float(self.alignment_threshold.get())
         tracker_mode = self.character_tracker_mode.get()
@@ -1784,6 +1891,8 @@ class VosApp:
             else float(self.config["auto_align_random_delay_min_seconds"]))
         random_delay_max = (float(self.auto_align_random_delay_max.get()) if random_mode
             else float(self.config["auto_align_random_delay_max_seconds"]))
+        side_anchor_left = int(self.side_anchor_left.get())
+        side_anchor_right = int(self.side_anchor_right.get())
         yeti_rate = float(self.yeti_check_rate.get())
         yeti_threshold = float(self.yeti_threshold.get())
         yeti_band_padding = int(self.yeti_band_padding.get())
@@ -1800,6 +1909,10 @@ class VosApp:
             raise ValueError("Map checks per second must be between 1 and 100.")
         if not 0.5 <= threshold <= 0.9999:
             raise ValueError("Map match threshold must be between 0.5 and 0.9999.")
+        if not 1 <= minimap_rate <= 30:
+            raise ValueError("Minimap checks per second must be between 1 and 30.")
+        if not 0.5 <= minimap_threshold <= 0.9999:
+            raise ValueError("Minimap match threshold must be between 0.5 and 0.9999.")
         if not 1 <= alignment_rate <= 60:
             raise ValueError("Alignment checks per second must be between 1 and 60.")
         if not 0.5 <= alignment_threshold <= 0.9999:
@@ -1814,6 +1927,8 @@ class VosApp:
             raise ValueError("Random happy tolerance must be 0–500 px, with min no greater than max.")
         if not 0 <= random_delay_min <= random_delay_max <= 30:
             raise ValueError("Random move delay must be 0–30 seconds, with min no greater than max.")
+        if not 0 <= side_anchor_left < side_anchor_right <= 100:
+            raise ValueError("Left side anchor must be to the left of the right side anchor (0–100%).")
         if not 1 <= yeti_rate <= 100:
             raise ValueError("Yeti checks per second must be between 1 and 100.")
         if not 0.5 <= yeti_threshold <= 0.9999:
@@ -1847,6 +1962,10 @@ class VosApp:
             "vos_map_checker_enabled": bool(self.map_checker_enabled.get()),
             "vos_map_checks_per_second": check_rate,
             "vos_map_match_threshold": threshold,
+            "minimap_checker_enabled": bool(self.minimap_checker_enabled.get()),
+            "minimap_debug_overlay": bool(self.minimap_debug_overlay.get()),
+            "minimap_checks_per_second": minimap_rate,
+            "minimap_match_threshold": minimap_threshold,
             "alignment_overlay_enabled": bool(self.alignment_enabled.get()),
             "alignment_checks_per_second": alignment_rate,
             "alignment_match_threshold": alignment_threshold,
@@ -1872,6 +1991,9 @@ class VosApp:
             "loot_crystal": bool(self.loot_crystal.get()),
             "alignment_target_mode": self.alignment_target_mode.get(),
             "manual_anchor_offset": int(self.manual_anchor_offset.get()),
+            "side_anchor_left_percent": side_anchor_left,
+            "side_anchor_right_percent": side_anchor_right,
+            "show_side_anchors": bool(self.show_side_anchors.get()),
             "yeti_required": bool(self.yeti_required.get()),
             "yeti_checks_per_second": yeti_rate,
             "yeti_match_threshold": yeti_threshold,
@@ -2218,6 +2340,33 @@ class VosApp:
         self._anchor_save_job = None
         save_config(self.config)
 
+    def update_side_anchor_labels(self):
+        self.side_anchor_left_label.configure(text=f"Left limit: {self.side_anchor_left.get()}%")
+        self.side_anchor_right_label.configure(text=f"Right limit: {self.side_anchor_right.get()}%")
+
+    def on_show_side_anchors_changed(self):
+        shown = bool(self.show_side_anchors.get())
+        self.config["show_side_anchors"] = shown
+        save_config(self.config)
+        log(f"Side anchor guides {'shown' if shown else 'hidden'}", diagnostic=True)
+
+    def on_side_anchor_moved(self, side, value):
+        position = max(0, min(100, int(round(float(value)))))
+        if side == "left":
+            self.side_anchor_left.set(min(position, self.side_anchor_right.get() - 1))
+        else:
+            self.side_anchor_right.set(max(position, self.side_anchor_left.get() + 1))
+        self.config["side_anchor_left_percent"] = int(self.side_anchor_left.get())
+        self.config["side_anchor_right_percent"] = int(self.side_anchor_right.get())
+        self.update_side_anchor_labels()
+        if self._side_anchor_save_job is not None:
+            self.root.after_cancel(self._side_anchor_save_job)
+        self._side_anchor_save_job = self.root.after(300, self.save_side_anchors)
+
+    def save_side_anchors(self):
+        self._side_anchor_save_job = None
+        save_config(self.config)
+
     def start_auto_align_controller(self):
         if self.auto_align_thread is not None and self.auto_align_thread.is_alive():
             return
@@ -2278,6 +2427,7 @@ class VosApp:
             detector_rate = max(1.0, float(self.config.get("alignment_checks_per_second", 10)))
             if (
                 bulb is None
+                or client_bbox is None
                 or time.monotonic() - checked > max(0.5, 3.0 / detector_rate)
             ):
                 self.auto_align_move_order = None
@@ -2289,18 +2439,19 @@ class VosApp:
             loot_pending = bool(
                 self.config.get("loot_crystal", False) and crystal is not None
             )
+            client_width = client_bbox[2] - client_bbox[0]
+            left_limit, right_limit = side_anchor_bounds(self.config, client_width)
             character_x = bulb[0] + bulb[2] / 2.0
             if loot_pending:
                 target_name = "Crystal"
-                target_x = crystal[0] + crystal[2] / 2.0
+                raw_target_x = crystal[0] + crystal[2] / 2.0
             elif self.config.get("alignment_target_mode", "area") == "manual":
                 target_name = "Manual anchor"
-                client_width = client_bbox[2] - client_bbox[0]
                 offset = int(self.config.get("manual_anchor_offset", 0))
-                target_x = max(0, min(client_width - 1, client_width / 2.0 + offset))
+                raw_target_x = max(0, min(client_width - 1, client_width / 2.0 + offset))
             elif area is not None:
                 target_name = "Area"
-                target_x = area[0] + area[2] / 2.0
+                raw_target_x = area[0] + area[2] / 2.0
             else:
                 self.auto_align_move_order = None
                 self.auto_align_direction = "Waiting for area marker"
@@ -2308,6 +2459,9 @@ class VosApp:
                 self.auto_align_stop.wait(interval)
                 continue
 
+            target_x = max(left_limit, min(right_limit, raw_target_x))
+            if loot_pending and target_x != raw_target_x:
+                target_name = "Crystal at left limit" if raw_target_x < left_limit else "Crystal at right limit"
             delta = character_x - target_x
             randomize = bool(self.config.get("auto_align_randomize", False))
             # Track the object, not its exact x coordinate: moving/jittering
@@ -2330,7 +2484,7 @@ class VosApp:
             tolerance = (5 if loot_pending else self.auto_align_random_tolerance if randomize else
                 max(0, int(self.config.get("auto_align_tolerance_pixels", 8))))
             self.auto_align_delta = delta
-            if abs(delta) <= tolerance:
+            if alignment_goal_met(character_x, target_x, tolerance, left_limit, right_limit):
                 self.auto_align_move_order = None
                 self.auto_align_correction_active = False
                 if loot_pending:
@@ -2339,7 +2493,9 @@ class VosApp:
                 if self.spam_paused_reason == "Moving":
                     self.spam_paused_reason = None
                 if loot_pending:
-                    self.auto_align_direction = "Crystal line reached"
+                    self.auto_align_direction = (
+                        "Crystal side limit reached" if target_x != raw_target_x
+                        else "Crystal line reached")
                 else:
                     self.auto_align_direction = "Aligned"
                 self.auto_align_stop.wait(interval)
@@ -2356,7 +2512,8 @@ class VosApp:
                     order = sample_alignment_move_order(self.config, time.monotonic(), target_id)
                     self.auto_align_move_order = order
                     self.auto_align_random_tolerance = order.tolerance_pixels
-                    if abs(delta) <= (5 if loot_pending else order.tolerance_pixels):
+                    if alignment_goal_met(character_x, target_x,
+                            5 if loot_pending else order.tolerance_pixels, left_limit, right_limit):
                         self.auto_align_move_order = None
                         self.alignment_move_pending = False
                         if self.spam_paused_reason == "Moving":
@@ -2601,6 +2758,19 @@ class VosApp:
             map_color = "green" if map_matched else "red"
         score_suffix = f" ({map_score:.2f})" if map_text in {"Matched", "Not detected"} else ""
         self.map_status.configure(text=map_text + score_suffix, foreground=map_color)
+        minimap_rect, minimap_score, _, minimap_player, minimap_count, minimap_checked = self.minimap_detector.snapshot()
+        if not self.config.get("minimap_checker_enabled", False):
+            minimap_text, minimap_color = "Off", "gray"
+        elif "minimap" not in self.vision.gray_templates:
+            minimap_text, minimap_color = "Missing minimap.png", "red"
+        elif minimap_rect is None or time.monotonic() - minimap_checked > 2:
+            score_text = f" (best {minimap_score:.2f})" if minimap_checked else ""
+            minimap_text, minimap_color = "Looking for minimap" + score_text, "orange"
+        else:
+            player_text = "you located" if minimap_player is not None else "yellow marker missing"
+            minimap_text = f"{minimap_count} other marker(s), {player_text} (map {minimap_score:.2f})"
+            minimap_color = "red" if minimap_count else "green"
+        self.minimap_status.configure(text=minimap_text, foreground=minimap_color)
         if self.alignment_overlay is not None:
             (
                 overlay_text,
@@ -2684,8 +2854,12 @@ class VosApp:
         self.root.after(500, self.refresh_status)
 
     def on_close(self):
+        if self._side_anchor_save_job is not None:
+            self.root.after_cancel(self._side_anchor_save_job)
+            self.save_side_anchors()
         self.stop_vos("application closing")
         self.map_detector.stop()
+        self.minimap_detector.stop()
         self.yeti_detector.stop()
         self.thorns_detector.stop()
         self.shop_controller.stop()

@@ -1,6 +1,6 @@
 # Maplestory VOS
 
-Current release: **2.1.1**. See [CHANGELOG.md](CHANGELOG.md) for the release
+Current release: **2.2.0**. See [CHANGELOG.md](CHANGELOG.md) for the release
 summary. This repository contains the full Python source, image assets,
 Arduino/Teensy firmware, tests, and a self-contained Windows release ZIP.
 
@@ -23,8 +23,11 @@ A separate Windows helper that repeatedly sends a selected key while
 
 ## Portable Windows package
 
-Download `Maplestory-VOS-v2.1.1-Windows-x64.zip` from the GitHub release,
-extract the **entire** archive, and run `Maplestory-VOS.exe`. It includes Python and the required desktop
+Download `Maplestory-VOS-v2.2.0-Windows-x64.zip` from the GitHub release,
+extract the **entire** archive, and run `Maplestory-VOS.exe`. The local
+`Releases/Maplestory-VOS-v2.2.0/` folder is already unpacked and can be run
+directly. Keep its `_internal` folder beside the EXE; the EXE alone is not
+portable. The package includes Python and the required desktop
 libraries; the other files and `_internal` directory must stay beside the EXE.
 Settings and logs are written beside the EXE, so extract to a writable folder
 (not `Program Files`). The Arduino/Teensy firmware still needs to be flashed to
@@ -38,14 +41,14 @@ the device once; it cannot be bundled into the Windows executable.
 
 To build the portable Windows package yourself, install `pyinstaller` as well
 and run `powershell -ExecutionPolicy Bypass -File .\build_release.ps1` from
-this directory. The ZIP is written to `Releases/`.
+this directory. The ZIP and ready-to-run folder are written to `Releases/`.
 
 Defaults: `F11` toggles the whole helper, and `F10` starts/stops VoS spam.
 The output key, hold time, repeat interval, COM port, and hotkeys are editable.
 The GUI keeps live Status and a prominent **Save settings** button at the top,
 Logs at the bottom, and
-groups feature controls into Spam, Alignment, Shop, Buff / Map, and General
-tabs. Save after editing entry fields or selecting the character marker;
+groups feature controls into Spam, Alignment, Shop, Buff / Map, General, and
+Minimap tabs. Save after editing entry fields or selecting the character marker;
 smaller windows can still scroll within each tab. Tabs are left-aligned. Drag
 the divider above Logs to resize the log area, then click **Save settings**
 to remember its height for the next launch.
@@ -59,6 +62,17 @@ if that misses, it immediately searches the full game window and updates the
 cache when found elsewhere. If the map is absent, VoS stays enabled but pauses
 with **Waiting for map**, then resumes automatically when it reappears.
 Detection rate and match threshold are configurable in the GUI.
+
+The experimental Minimap tab uses `assets/minimap.png` to locate
+the minimap, then counts red markers (other players) and locates the yellow
+marker (your character) by colour within its playfield. It first checks near
+the last minimap position and searches the full client immediately if that
+misses. The optional debug overlay boxes the minimap and detected markers.
+This is WIP and informational only: it does not pause VoS or control movement.
+Marker counts are indicative and should be checked against the live debug
+overlay. The saved configuration in this release has the checker and debug
+overlay enabled; untick them if minimap matching is inaccurate or uses too
+much CPU on your system.
 
 The optional Character / Area Alignment Test can track either `assets/lightbulb.png`
 or the two-chevron shape derived at runtime from `assets/tracker.png` (choose
@@ -116,6 +130,17 @@ The normal green target can use either the center of `area.png` or a manual
 horizontal anchor. Manual offset `0` is the center of the DreamMS client;
 negative pixel offsets move the target left and positive offsets move it right.
 The visual guide and auto-alignment use the same selected target.
+
+The Alignment tab also has two **Side anchors** that mark the character's
+reachable horizontal range. The sliders use percentages of the DreamMS client
+width (0% = left edge, 100% = right edge), and the click-through overlay draws
+orange vertical limit lines. Both the normal target and crystal target are
+clamped to this range. If a crystal's red line is beyond a limit, reaching the
+limit within 5 px satisfies that crystal and retires its red guide, even when
+the crystal image remains on screen. Defaults are the two window edges, so
+existing alignment is unchanged until you move the limits. **Show side anchor
+lines in alignment overlay** hides or shows only the orange guides; the travel
+limits remain active when the guides are hidden.
 
 Auto alignment can optionally use those two center lines while VoS spam is
 running. Inside the configured pixel tolerance it does nothing; outside the

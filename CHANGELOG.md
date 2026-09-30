@@ -1,5 +1,19 @@
 # Changelog
 
+## 2.2.0
+
+- Add left and right side anchors to constrain auto-alignment's reachable
+  horizontal range. Normal and crystal targets are clamped to those limits;
+  reaching a limit satisfies an otherwise unreachable crystal.
+- Make the side-anchor guide lines optional without changing movement limits.
+  Crystal contact uses a 5 px tolerance and retires the targeted crystal guide
+  even if the image remains visible.
+- Add an experimental minimap marker checker (WIP). It locates the minimap,
+  counts red markers, identifies the yellow player marker, and can draw debug
+  boxes. Detection does not affect spam or movement and still needs live-game
+  tuning; its controls and saved settings are included for testing.
+- Add minimap regression tests and fix its startup colour-template error.
+
 ## 2.1.1
 
 - Make automatic selling take priority over the map gate, buffs, movement,

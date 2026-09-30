@@ -16,7 +16,7 @@ from arrow_tracker import ArrowShapeTracker
 TEMPLATE_NAMES = (
     "VOS_map", "yeti", "yeti2", "crown", "crown2", "thorns", "lightbulb",
     "area", "crystal", "inventory", "shop", "shop_open", "sell_button",
-    "sell_confirm", "invent_empty", "shop_exit",
+    "sell_confirm", "invent_empty", "shop_exit", "minimap",
 )
 
 
@@ -115,6 +115,8 @@ class VisionRuntime:
             rates.append(float(config.get("yeti_checks_per_second", 10)))
         if config.get("buff_enabled"):
             rates.append(float(config.get("thorns_checks_per_second", 2)))
+        if config.get("minimap_checker_enabled"):
+            rates.append(float(config.get("minimap_checks_per_second", 5)))
         if any(config.get(name, False) for name in (
             "alignment_overlay_enabled", "auto_align_enabled", "show_spammer_overlay", "show_latency_overlay", "show_crystal"
         )):
