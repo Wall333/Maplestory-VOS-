@@ -1,5 +1,22 @@
 # Changelog
 
+## 2.2.2
+
+- Make crystal-contact tolerance configurable independently of normal and
+  randomized alignment tolerance, including crystals clamped to side anchors.
+- Add optional directional teleport with a selectable key, estimated jump
+  distance, and distance allowance. Use walking near the target and wait for
+  a fresh frame after each teleport before moving again.
+- Use existing Arduino arrow-down/up commands and support Windows input.
+- Include the current saved settings: 20 px crystal contact, teleport off
+  (V selected, 150 px distance, 25 px allowance), random tolerance 20–100 px,
+  and randomized pre-move wait of 1–10 seconds.
+- Add movement/input regression tests. Minimap remains experimental WIP.
+- Known limitation: walking commands acknowledge transmission, not Arduino
+  hold completion. A movement pause can clear early with short check intervals;
+  this release retains the saved 0.5 s interval and 0.4 s hold and does not
+  include a hold-completion fix.
+
 ## 2.2.1
 
 - Add optional Magic Guard maintenance using `assets/magic guard.png`, with

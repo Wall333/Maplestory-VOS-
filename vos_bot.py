@@ -103,6 +103,11 @@ DEFAULTS = {
     "spam_overlay_y_percent": 4,
     "show_crystal": True,
     "loot_crystal": True,
+    "crystal_contact_tolerance_pixels": 5,
+    "auto_align_use_teleport": False,
+    "auto_align_teleport_key": "ALT",
+    "auto_align_teleport_distance_pixels": 150,
+    "auto_align_teleport_margin_pixels": 25,
     "yeti_required": True,
     "show_yeti_overlay": False,
     "yeti_checks_per_second": 10,
@@ -132,7 +137,10 @@ DEFAULTS = {
 }
 
 SPAM_KEYS = ("END", "PGDN", "X", "C", "V", "B", "D", "F", "Y")
+TELEPORT_KEYS = SPAM_KEYS + ("ALT", "CTRL")
 VK_KEYS = {
+    "ALT": 0x12,
+    "CTRL": 0x11,
     "END": 0x23,
     "PGDN": 0x22,
     "X": 0x58,
@@ -144,6 +152,8 @@ VK_KEYS = {
     "Y": 0x59,
 }
 OUTPUT_ALIASES = {
+    "ALT": "ALT",
+    "CTRL": "CTRL",
     "END": "END",
     "PGDN": "PGDN",
     "PAGE DOWN": "PGDN",
@@ -190,6 +200,17 @@ def side_anchor_bounds(config, client_width):
 def alignment_goal_met(character_x, target_x, tolerance, left_limit, right_limit):
     return (abs(character_x - target_x) <= tolerance
         and left_limit - 5 <= character_x <= right_limit + 5)
+
+
+def alignment_teleport_allowed(config, character_x, target_x, left_limit, right_limit):
+    if not config.get("auto_align_use_teleport", False):
+        return False
+    distance = max(1, int(config.get("auto_align_teleport_distance_pixels", 150)))
+    margin = max(0, int(config.get("auto_align_teleport_margin_pixels", 25)))
+    delta = target_x - character_x
+    landing = character_x + (distance if delta > 0 else -distance)
+    return (abs(delta) >= distance + margin
+            and left_limit + margin <= landing <= right_limit - margin)
 
 
 def load_config():
@@ -336,7 +357,7 @@ class ArduinoConnection:
 
     def send_command(self, config, command, hold_seconds):
         command = str(command).strip().upper()
-        allowed = set(SPAM_KEYS) | {"LEFT", "RIGHT", "CLICK"}
+        allowed = set(TELEPORT_KEYS) | {"LEFT", "RIGHT", "CLICK", "LEFT_DOWN", "LEFT_UP", "RIGHT_DOWN", "RIGHT_UP"}
         if command not in allowed:
             return False
         payload = f"{command} {max(1, round(hold_seconds * 1000))}\n"
@@ -361,6 +382,19 @@ class ArduinoConnection:
 
     def send_key(self, config, key, hold_seconds):
         return self.send_command(config, normalize_output_key(key), hold_seconds)
+
+    def send_teleport(self, config, direction, key):
+        if direction not in ("LEFT", "RIGHT"):
+            return False
+        sent = False
+        try:
+            if self.send_command(config, direction + "_DOWN", 0):
+                time.sleep(.02)
+                sent = self.send_key(config, key, .03)
+                time.sleep(.03)
+        finally:
+            released = self.send_command(config, direction + "_UP", 0)
+        return sent and released
 
 
 ARDUINO = ArduinoConnection()
@@ -727,6 +761,7 @@ class AlignmentOverlay:
         self.thread = None
         self.character_thread = None
         self.context_sequence = -1
+        self.character_captured_at = 0.0
         self.hwnd = None
         self.client_bbox = None
         self.bulb_match = None
@@ -959,6 +994,7 @@ class AlignmentOverlay:
                     with self.lock:
                         self.bulb_match, self.bulb_score = character, float(score)
                         self.last_check = time.monotonic()
+                        self.character_captured_at = packet.captured_at
                         self._refresh_match_status_locked()
                     vision.record("cycle.character", time.perf_counter() - started)
                     vision.record("frame_age.character", time.monotonic() - packet.captured_at)
@@ -1261,6 +1297,24 @@ def send_windows_direction(direction, hold_seconds):
             time.sleep(hold_seconds)
 
 
+def set_windows_direction(direction, pressed):
+    vk = 0x25 if direction == "LEFT" else 0x27
+    extra = ctypes.c_ulong(0)
+    union = InputUnion()
+    union.ki = KeyboardInput(vk, 0, 0 if pressed else 0x0002, 0, ctypes.pointer(extra))
+    item = Input(1, union)
+    ctypes.WinDLL("user32", use_last_error=True).SendInput(1, ctypes.byref(item), ctypes.sizeof(item))
+
+
+def send_windows_teleport(direction, key):
+    try:
+        set_windows_direction(direction, True)
+        time.sleep(.02)
+        send_windows_key(key, .03)
+    finally:
+        set_windows_direction(direction, False)
+
+
 class VosApp:
     def __init__(self, root):
         self.root = root
@@ -1299,6 +1353,7 @@ class VosApp:
         self.auto_align_last_move_check = 0.0
         self.auto_align_correction_active = False
         self.auto_align_move_count = 0
+        self.auto_align_teleport_ready_at = 0.0
         self._anchor_save_job = None
         self._side_anchor_save_job = None
         self._monster_area_save_job = None
@@ -1785,6 +1840,32 @@ class VosApp:
                 row=19, column=1, sticky="ew", pady=5)
         self.update_latency_overlay_position_labels()
 
+        travel = ttk.LabelFrame(alignment_tab, text="Crystal contact / teleport movement", padding=10)
+        travel.pack(fill="x", pady=(10, 0))
+        ttk.Label(travel, text="Crystal contact tolerance (px):").grid(row=0, column=0, sticky="w", pady=5)
+        self.crystal_contact_tolerance = ttk.Entry(travel, width=14)
+        self.crystal_contact_tolerance.insert(0, str(self.config["crystal_contact_tolerance_pixels"]))
+        self.crystal_contact_tolerance.grid(row=0, column=1, sticky="w")
+        self.auto_align_use_teleport = tk.BooleanVar(value=bool(self.config["auto_align_use_teleport"]))
+        ttk.Checkbutton(travel, text="Use teleport for distant alignment moves",
+            variable=self.auto_align_use_teleport, command=self.on_teleport_changed).grid(
+                row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Label(travel, text="Teleport key:").grid(row=2, column=0, sticky="w", pady=5)
+        self.auto_align_teleport_key = ttk.Combobox(travel, values=TELEPORT_KEYS, state="readonly", width=12)
+        self.auto_align_teleport_key.set(self.config["auto_align_teleport_key"])
+        self.auto_align_teleport_key.grid(row=2, column=1, sticky="w")
+        ttk.Label(travel, text="Teleport distance (px):").grid(row=3, column=0, sticky="w", pady=5)
+        self.auto_align_teleport_distance = ttk.Entry(travel, width=14)
+        self.auto_align_teleport_distance.insert(0, str(self.config["auto_align_teleport_distance_pixels"]))
+        self.auto_align_teleport_distance.grid(row=3, column=1, sticky="w")
+        ttk.Label(travel, text="Extra distance allowance (px):").grid(row=4, column=0, sticky="w", pady=5)
+        self.auto_align_teleport_margin = ttk.Entry(travel, width=14)
+        self.auto_align_teleport_margin.insert(0, str(self.config["auto_align_teleport_margin_pixels"]))
+        self.auto_align_teleport_margin.grid(row=4, column=1, sticky="w")
+        ttk.Label(travel, text="Teleport only when enough distance remains; walk for the final correction.\n"
+                  "Set distance to the maximum observed jump. Save key and numeric changes.",
+                  justify="left", wraplength=490).grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
         side_anchors = ttk.LabelFrame(alignment_tab, text="Side anchors / character travel limits", padding=10)
         side_anchors.pack(fill="x", pady=(10, 0))
         ttk.Label(side_anchors, text=(
@@ -1882,6 +1963,15 @@ class VosApp:
             canvas.yview_scroll(-1 if delta > 0 else 1, "units")
 
     def read_form(self):
+        crystal_tolerance = int(self.crystal_contact_tolerance.get())
+        teleport_distance = int(self.auto_align_teleport_distance.get())
+        teleport_margin = int(self.auto_align_teleport_margin.get())
+        if not 0 <= crystal_tolerance <= 10000:
+            raise ValueError("Crystal contact tolerance must be between 0 and 10000 pixels.")
+        if not 1 <= teleport_distance <= 2000 or not 0 <= teleport_margin <= 2000:
+            raise ValueError("Teleport distance must be 1–2000 px and allowance 0–2000 px.")
+        if self.auto_align_teleport_key.get() not in TELEPORT_KEYS:
+            raise ValueError("Select an available teleport key.")
         guard_settings = {key: float(entry.get()) for key, entry in self.magic_guard_fields.items()}
         for key, lower, upper in (
             ("magic_guard_key_hold", .001, 1),
@@ -2007,6 +2097,11 @@ class VosApp:
             raise ValueError("Master and VoS toggle hotkeys must be different.")
         self.config.update({
             "enabled": self.master_enabled,
+            "crystal_contact_tolerance_pixels": crystal_tolerance,
+            "auto_align_use_teleport": bool(self.auto_align_use_teleport.get()),
+            "auto_align_teleport_key": self.auto_align_teleport_key.get(),
+            "auto_align_teleport_distance_pixels": teleport_distance,
+            "auto_align_teleport_margin_pixels": teleport_margin,
             **guard_settings,
             "magic_guard_enabled": bool(self.magic_guard_enabled.get()),
             "magic_guard_key": normalize_output_key(self.magic_guard_key.get()),
@@ -2275,6 +2370,12 @@ class VosApp:
         save_config(self.config)
         log(f"Auto alignment {'enabled' if enabled else 'disabled'}")
 
+    def on_teleport_changed(self):
+        enabled = bool(self.auto_align_use_teleport.get())
+        self.config["auto_align_use_teleport"] = enabled
+        save_config(self.config)
+        log(f"Alignment teleport {'enabled' if enabled else 'disabled'}")
+
     def _reset_alignment_randomizer(self):
         self.auto_align_move_order = None
         self.auto_align_random_tolerance = None
@@ -2478,6 +2579,9 @@ class VosApp:
                 self.auto_align_stop.wait(0.10)
                 continue
 
+            # Read the capture stamp before the locked position snapshot: an
+            # older position must never be paired with a newer frame stamp.
+            character_captured = getattr(self.alignment_overlay, "character_captured_at", None)
             (
                 _,
                 client_bbox,
@@ -2501,6 +2605,14 @@ class VosApp:
                 self.auto_align_delta = None
                 self.auto_align_stop.wait(interval)
                 continue
+
+            teleport_ready = getattr(self, "auto_align_teleport_ready_at", 0.0)
+            if teleport_ready and (time.monotonic() < teleport_ready or
+                    (checked if character_captured is None else character_captured) < teleport_ready):
+                self.auto_align_direction = "Moving; waiting for teleport position"
+                self.auto_align_stop.wait(.05)
+                continue
+            self.auto_align_teleport_ready_at = 0.0
 
             loot_pending = bool(
                 self.config.get("loot_crystal", False) and crystal is not None
@@ -2545,9 +2657,9 @@ class VosApp:
                 self.auto_align_random_tolerance = random.randint(
                     int(self.config["auto_align_random_tolerance_min_pixels"]),
                     int(self.config["auto_align_random_tolerance_max_pixels"]))
-            # Reaching the crystal's line is stricter than the ordinary happy
-            # tolerance, which may be deliberately wide or randomized.
-            tolerance = (5 if loot_pending else self.auto_align_random_tolerance if randomize else
+            # Crystal contact has its own tolerance, independent of random happy tolerance.
+            crystal_tolerance = max(0, int(self.config.get("crystal_contact_tolerance_pixels", 5)))
+            tolerance = (crystal_tolerance if loot_pending else self.auto_align_random_tolerance if randomize else
                 max(0, int(self.config.get("auto_align_tolerance_pixels", 8))))
             self.auto_align_delta = delta
             if alignment_goal_met(character_x, target_x, tolerance, left_limit, right_limit):
@@ -2579,7 +2691,7 @@ class VosApp:
                     self.auto_align_move_order = order
                     self.auto_align_random_tolerance = order.tolerance_pixels
                     if alignment_goal_met(character_x, target_x,
-                            5 if loot_pending else order.tolerance_pixels, left_limit, right_limit):
+                            crystal_tolerance if loot_pending else order.tolerance_pixels, left_limit, right_limit):
                         self.auto_align_move_order = None
                         self.alignment_move_pending = False
                         if self.spam_paused_reason == "Moving":
@@ -2603,6 +2715,7 @@ class VosApp:
 
             direction = "RIGHT" if delta < 0 else "LEFT"
             hold = max(0.001, float(self.config.get("auto_align_key_hold", 0.03)))
+            teleport = alignment_teleport_allowed(self.config, character_x, target_x, left_limit, right_limit)
             with self.input_lock:
                 can_move = (self.config.get("auto_align_enabled", False)
                     and self.spam_active and self.shop_controller.state == "idle"
@@ -2613,7 +2726,13 @@ class VosApp:
                 else:
                     self.alignment_move_pending = True
                     self.spam_paused_reason = "Moving"
-                    if self.config.get("use_arduino", True):
+                    if teleport and self.config.get("use_arduino", True):
+                        sent = ARDUINO.send_teleport(self.config, direction,
+                            self.config.get("auto_align_teleport_key", "ALT"))
+                    elif teleport:
+                        send_windows_teleport(direction, self.config.get("auto_align_teleport_key", "ALT"))
+                        sent = True
+                    elif self.config.get("use_arduino", True):
                         sent = ARDUINO.send_command(self.config, direction, hold)
                     else:
                         send_windows_direction(direction, hold)
@@ -2624,7 +2743,9 @@ class VosApp:
                 continue
 
             if sent:
-                self.auto_align_direction = f"Moving {direction} ({target_name})"
+                self.auto_align_direction = f"{'Teleporting' if teleport else 'Moving'} {direction} ({target_name})"
+                if teleport:
+                    self.auto_align_teleport_ready_at = time.monotonic() + .3
                 self.auto_align_move_count += 1
                 if randomize:
                     self.auto_align_correction_active = True
@@ -2670,6 +2791,7 @@ class VosApp:
             "Moving" if self.alignment_move_pending else None)
         self.buff_resume_not_before = 0.0
         self.spam_active = True
+        self.auto_align_teleport_ready_at = 0.0
         self.worker = threading.Thread(target=self._spam_loop, name="vos-spam", daemon=True)
         self.worker.start()
         log(f"VoS spam ON ({self.config['vos_output_key']})" + ("; waiting for map" if waiting_for_map else ""))

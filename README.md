@@ -1,6 +1,6 @@
 # Maplestory VOS
 
-Current release: **2.2.1**. See [CHANGELOG.md](CHANGELOG.md) for the release
+Current release: **2.2.2**. See [CHANGELOG.md](CHANGELOG.md) for the release
 summary. This repository contains the full Python source, image assets,
 Arduino/Teensy firmware, tests, and a self-contained Windows release ZIP.
 
@@ -13,19 +13,21 @@ A separate Windows helper that repeatedly sends a selected key while
 - Spam `F` every 2 seconds.
 - Manual green anchor 22px left of the horizontal center (`-22px`).
 - Auto-align enabled with a 0.4s movement hold. Random mode is on by default:
-  100–200px happy tolerance and a 2–10s pre-move wait while spam continues.
+  20–100px happy tolerance and a 1–10s pre-move wait while spam continues.
   Fixed-mode values (when random mode is off) are 200px tolerance and a 0.5s
   correction interval.
 - Crystal display/looting, Yeti-required spam, and Thorns maintenance enabled.
+- Saved crystal-contact tolerance is 20 px. Teleport is off, with V selected,
+  a 150 px jump estimate and 25 px extra allowance.
 - Map threshold `0.60`; alignment threshold `0.70`; Yeti threshold `0.70`; Thorns threshold `0.50`.
 - Automatic Yeti vertical band (120 px padding; full reacquisition every 2 seconds).
 - Spam badge at horizontal `85%`, vertical `4%`; latency badge at `20%`, `5%`.
 
 ## Portable Windows package
 
-Download `Maplestory-VOS-v2.2.1-Windows-x64.zip` from the GitHub release,
+Download `Maplestory-VOS-v2.2.2-Windows-x64.zip` from the GitHub release,
 extract the **entire** archive, and run `Maplestory-VOS.exe`. The local
-`Releases/Maplestory-VOS-v2.2.1/` folder is already unpacked and can be run
+`Releases/Maplestory-VOS-v2.2.2/` folder is already unpacked and can be run
 directly. Keep its `_internal` folder beside the EXE; the EXE alone is not
 portable. The package includes Python and the required desktop
 libraries; the other files and `_internal` directory must stay beside the EXE.
@@ -136,7 +138,7 @@ reachable horizontal range. The sliders use percentages of the DreamMS client
 width (0% = left edge, 100% = right edge), and the click-through overlay draws
 orange vertical limit lines. Both the normal target and crystal target are
 clamped to this range. If a crystal's red line is beyond a limit, reaching the
-limit within 5 px satisfies that crystal and retires its red guide, even when
+limit within the configured crystal-contact tolerance satisfies that crystal and retires its red guide, even when
 the crystal image remains on screen. Defaults are the two window edges, so
 existing alignment is unchanged until you move the limits. **Show side anchor
 lines in alignment overlay** hides or shows only the orange guides; the travel
@@ -167,11 +169,24 @@ The in-game overlay can show a large live `SPAMMER ON/OFF` badge. Enabling
 **Show crystal** detects `assets/crystal.png` and draws a red vertical guide
 while the crystal remains visible. With **Loot crystal** enabled,
 auto-alignment prioritizes that red line, even during a pending randomized
-move. Crystal contact uses a tight 5 px threshold instead of the normal happy
-tolerance. Once the character reaches the line, that crystal's red guide is
+move. **Crystal contact tolerance (px)** in Alignment is separate from the
+normal happy tolerance and defaults to 5 px. It also applies to crystals clamped
+to a side anchor. Once the character reaches that tolerance, its red guide is
 retired and alignment returns to the normal target, even if the crystal image
 remains visible because it cannot be looted. The same crystal is ignored until
 it disappears for several checks; a newly appearing crystal can be targeted.
+
+**Use teleport for distant alignment moves** in Alignment holds LEFT or RIGHT,
+presses the selected teleport key, then releases the direction. It uses the
+existing firmware's arrow-down/up commands and also supports Windows input.
+Set the teleport key (default ALT), distance (default 150 px), and extra
+distance allowance (default 25 px), then save settings. Teleport is initially
+off. It is used only when the target is at least distance plus allowance away
+and the predicted landing stays inside the side anchors with that allowance.
+Closer corrections use walking. After each teleport, alignment waits for a
+fresh frame captured after a 0.3-second settling period before moving again.
+Use the maximum observed jump distance when tuning: the estimate cannot
+guarantee a landing if the game's actual teleport distance is larger.
 
 The resizable log area has two tabs: **Activity** for start/stop, shop/selling,
 buff actions, and errors; **Diagnostics** for detector changes, template match
