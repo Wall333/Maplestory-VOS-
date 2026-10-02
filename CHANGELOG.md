@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.2.1
+
+- Add optional Magic Guard maintenance using `assets/magic guard.png`, with
+  its own buff key, key hold, recovery wait, detection rate, and match threshold.
+- Pause spam and alignment when Magic Guard is missing, cast its key, wait,
+  and recheck before resuming. Thorns and Magic Guard are maintained
+  sequentially; shop handling keeps priority over both.
+- Show Magic Guard's detection state in live status and draw a yellow box
+  around its detected icon. Add regression tests for recovery and shop priority.
+- Retain minimap detection as experimental WIP.
+
 ## 2.2.0
 
 - Add left and right side anchors to constrain auto-alignment's reachable

@@ -1,6 +1,6 @@
 # Maplestory VOS
 
-Current release: **2.2.0**. See [CHANGELOG.md](CHANGELOG.md) for the release
+Current release: **2.2.1**. See [CHANGELOG.md](CHANGELOG.md) for the release
 summary. This repository contains the full Python source, image assets,
 Arduino/Teensy firmware, tests, and a self-contained Windows release ZIP.
 
@@ -23,9 +23,9 @@ A separate Windows helper that repeatedly sends a selected key while
 
 ## Portable Windows package
 
-Download `Maplestory-VOS-v2.2.0-Windows-x64.zip` from the GitHub release,
+Download `Maplestory-VOS-v2.2.1-Windows-x64.zip` from the GitHub release,
 extract the **entire** archive, and run `Maplestory-VOS.exe`. The local
-`Releases/Maplestory-VOS-v2.2.0/` folder is already unpacked and can be run
+`Releases/Maplestory-VOS-v2.2.1/` folder is already unpacked and can be run
 directly. Keep its `_internal` folder beside the EXE; the EXE alone is not
 portable. The package includes Python and the required desktop
 libraries; the other files and `_internal` directory must stay beside the EXE.
@@ -216,6 +216,17 @@ and movement pause, the configured buff key is sent, and the helper waits the
 configured recovery period (five seconds by default). It resumes only after
 the wait has elapsed and Thorns is detected; otherwise it retries. A small
 yellow rectangle marks the matched buff icon in the in-game overlay.
+
+Magic Guard maintenance is available in the **Buff / Map** tab. Enable it and
+set its buff key (initially Page Down), then save settings.
+It checks `assets/magic guard.png` on the shared capture stream, with independent
+match threshold, check rate, key hold, and recovery wait. Initial values are
+two checks per second, a 0.85 threshold, and a five-second recovery wait.
+Like Thorns, a missing icon pauses spam and movement, casts the buff, then
+waits and rechecks before resuming. A yellow box marks the detected icon.
+Both buffs can be enabled; they are cast sequentially, and selling retains
+priority. The built-in fallback leaves Magic Guard off; the saved configuration
+included in this release has it enabled with Page Down as its buff key.
 
 ## Arduino compatibility
 

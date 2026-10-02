@@ -119,6 +119,12 @@ DEFAULTS = {
     "buff_wait_seconds": 1.0,
     "thorns_checks_per_second": 2,
     "thorns_match_threshold": 0.50,
+    "magic_guard_enabled": False,
+    "magic_guard_key": "PGDN",
+    "magic_guard_key_hold": 0.03,
+    "magic_guard_wait_seconds": 5.0,
+    "magic_guard_checks_per_second": 2,
+    "magic_guard_match_threshold": 0.85,
     "use_arduino": True,
     "auto_detect_arduino": True,
     "serial_port": "COM3",
@@ -613,10 +619,16 @@ class YetiDetector:
 
 
 class ThornsDetector:
-    """Tracks the Thorns buff icon and its client-relative rectangle."""
+    """Tracks a configured buff icon on the shared capture stream."""
 
-    def __init__(self, app):
+    def __init__(self, app, name="thorns", label="Thorns", enabled_key="buff_enabled",
+                 rate_key="thorns_checks_per_second", threshold_key="thorns_match_threshold"):
         self.app = app
+        self.name = name
+        self.label = label
+        self.enabled_key = enabled_key
+        self.rate_key = rate_key
+        self.threshold_key = threshold_key
         self.stop_event = threading.Event()
         self.thread = None
         self.lock = threading.Lock()
@@ -631,7 +643,7 @@ class ThornsDetector:
         if self.thread is not None and self.thread.is_alive():
             return
         self.stop_event.clear()
-        self.thread = threading.Thread(target=self._shared_loop, name="thorns-detector", daemon=True)
+        self.thread = threading.Thread(target=self._shared_loop, name=f"{self.name}-detector", daemon=True)
         self.thread.start()
 
     def stop(self):
@@ -644,10 +656,10 @@ class ThornsDetector:
             return self.matched, self.status, self.score, self.last_check, self.match_rect
 
     def allows_spam(self):
-        if not self.app.config.get("buff_enabled", False):
+        if not self.app.config.get(self.enabled_key, False):
             return True
         matched, _, _, checked, _ = self.snapshot()
-        rate = max(1.0, float(self.app.config.get("thorns_checks_per_second", 2)))
+        rate = max(1.0, float(self.app.config.get(self.rate_key, 2)))
         return matched and time.monotonic() - checked <= max(0.5, 3.0 / rate)
 
     def _set_state(self, matched, status, score=0.0, match_rect=None):
@@ -659,11 +671,11 @@ class ThornsDetector:
             self.last_check = time.monotonic()
             self.match_rect = match_rect if matched else None
         if changed and status in {"Active", "Missing"}:
-            log(f"Thorns Buff: {status} | match={score:.3f}", diagnostic=True)
+            log(f"{self.label} Buff: {status} | match={score:.3f}", diagnostic=True)
 
     def _shared_loop(self):
         vision = self.app.vision
-        if "thorns" not in vision.templates:
+        if self.name not in vision.templates:
             self._set_state(False, "Template missing")
             return
         sequence, next_check = 0, 0.0
@@ -674,12 +686,12 @@ class ThornsDetector:
                     continue
                 sequence = packet.sequence
                 now = packet.captured_at
-                rate = max(1.0, min(100.0, float(self.app.config.get("thorns_checks_per_second", 2))))
+                rate = max(1.0, min(100.0, float(self.app.config.get(self.rate_key, 2))))
                 if now + .01 < next_check:
                     continue
                 next_check = now + 1 / rate
                 started = time.perf_counter()
-                if not self.app.config.get("buff_enabled", False):
+                if not self.app.config.get(self.enabled_key, False):
                     self._set_state(True, "Off", 1.0)
                 elif packet.context is None:
                     self.match_rect = None
@@ -689,15 +701,15 @@ class ThornsDetector:
                     if packet.context != self.cached_context:
                         self.match_rect = None
                         self.cached_context = packet.context
-                    threshold = max(.5, min(.9999, float(self.app.config.get("thorns_match_threshold", .85))))
+                    threshold = max(.5, min(.9999, float(self.app.config.get(self.threshold_key, .85))))
                     padding = int(self.app.config.get("vision_roi_padding", 120))
                     rect, score = vision.pool.submit(
-                        vision.match, packet, "thorns", threshold, self.match_rect, padding,
+                        vision.match, packet, self.name, threshold, self.match_rect, padding,
                     ).result()
                     self._set_state(rect is not None, "Active" if rect else "Missing", score, rect)
-                vision.record("cycle.thorns", time.perf_counter() - started)
+                vision.record(f"cycle.{self.name}", time.perf_counter() - started)
                 if packet.context is not None:
-                    vision.record("frame_age.thorns", time.monotonic() - packet.captured_at)
+                    vision.record(f"frame_age.{self.name}", time.monotonic() - packet.captured_at)
         except Exception as exc:
             self._set_state(False, f"Detector error: {exc}")
 
@@ -973,7 +985,7 @@ class AlignmentOverlay:
                 config = self.app.config
                 enabled = any(config.get(name, False) for name in (
                     "alignment_overlay_enabled", "auto_align_enabled", "show_spammer_overlay", "show_latency_overlay",
-                    "show_crystal", "buff_enabled", "inventory_debug", "show_yeti_overlay", "show_monster_area",
+                    "show_crystal", "buff_enabled", "magic_guard_enabled", "inventory_debug", "show_yeti_overlay", "show_monster_area",
                 ))
                 if not enabled:
                     continue
@@ -1036,6 +1048,8 @@ class AlignmentOverlay:
         show_crystal = bool(self.app.config.get("show_crystal", False))
         thorns_matched, _, _, _, thorns_rect = self.app.thorns_detector.snapshot()
         show_thorns = bool(self.app.config.get("buff_enabled", False) and thorns_matched)
+        guard_matched, _, _, _, guard_rect = self.app.magic_guard_detector.snapshot()
+        show_guard = bool(self.app.config.get("magic_guard_enabled", False) and guard_matched)
         show_inventory = bool(self.app.config.get("inventory_debug", False))
         yeti_rects, yeti_checked = self.app.yeti_detector.overlay_rects()
         show_yeti = bool(self.app.config.get("show_yeti_overlay", False))
@@ -1044,7 +1058,7 @@ class AlignmentOverlay:
         show_minimap = bool(self.app.config.get("minimap_debug_overlay", False)
                             and minimap_rect is not None and time.monotonic() - minimap_checked <= 1.0)
         if bbox is None or not (
-            guides_enabled or show_spammer or show_latency or (show_crystal and crystal is not None) or show_thorns or show_inventory or show_yeti or show_monster_area or show_minimap
+            guides_enabled or show_spammer or show_latency or (show_crystal and crystal is not None) or show_thorns or show_guard or show_inventory or show_yeti or show_monster_area or show_minimap
         ):
             self.window.withdraw()
         else:
@@ -1135,8 +1149,10 @@ class AlignmentOverlay:
                 self.canvas.create_oval(center_x - 6, center_y - 6, center_x + 6, center_y + 6, outline="#ff2020", width=3)
                 self.canvas.create_text(center_x + 9, max(10, center_y - 12), text="CRYSTAL", fill="#ff2020", anchor="w")
 
-            if show_thorns and thorns_rect is not None:
-                x, y, w, h = thorns_rect
+            for buff_shown, buff_rect in ((show_thorns, thorns_rect), (show_guard, guard_rect)):
+                if not buff_shown or buff_rect is None:
+                    continue
+                x, y, w, h = buff_rect
                 padding = 3
                 self.canvas.create_rectangle(
                     x - padding,
@@ -1268,6 +1284,8 @@ class VosApp:
         self.minimap_detector = MinimapDetector(self, log)
         self.yeti_detector = YetiDetector(self)
         self.thorns_detector = ThornsDetector(self)
+        self.magic_guard_detector = ThornsDetector(self, "magic_guard", "Magic Guard",
+            "magic_guard_enabled", "magic_guard_checks_per_second", "magic_guard_match_threshold")
         self.shop_controller = ShopController(self, globals())
         self.alignment_overlay = None
         self.auto_align_stop = threading.Event()
@@ -1298,6 +1316,7 @@ class VosApp:
         self.minimap_detector.start()
         self.yeti_detector.start()
         self.thorns_detector.start()
+        self.magic_guard_detector.start()
         self.shop_controller.start()
         self.alignment_overlay.start()
         self.start_auto_align_controller()
@@ -1394,6 +1413,9 @@ class VosApp:
         ttk.Label(status, text="Other players (minimap):").grid(row=11, column=0, sticky="w")
         self.minimap_status = ttk.Label(status, text="Starting...")
         self.minimap_status.grid(row=11, column=1, sticky="w", padx=10)
+        ttk.Label(status, text="Magic Guard buff:").grid(row=12, column=0, sticky="w")
+        self.magic_guard_status = ttk.Label(status, text="Off")
+        self.magic_guard_status.grid(row=12, column=1, sticky="w", padx=10)
 
         minimap_settings = ttk.LabelFrame(minimap_tab, text="Minimap markers", padding=10)
         minimap_settings.pack(fill="x", pady=10)
@@ -1573,6 +1595,29 @@ class VosApp:
         self.thorns_threshold = ttk.Entry(buff, width=14)
         self.thorns_threshold.insert(0, str(self.config["thorns_match_threshold"]))
         self.thorns_threshold.grid(row=5, column=1, sticky="w")
+
+        guard = ttk.LabelFrame(checks_tab, text="Magic Guard Buff", padding=10)
+        guard.pack(fill="x", pady=(10, 0))
+        self.magic_guard_enabled = tk.BooleanVar(value=bool(self.config["magic_guard_enabled"]))
+        ttk.Checkbutton(guard, text="Maintain Magic Guard while VoS is running",
+                        variable=self.magic_guard_enabled,
+                        command=self.on_magic_guard_enabled_changed).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(guard, text="Buff key:").grid(row=1, column=0, sticky="w", pady=5)
+        self.magic_guard_key = ttk.Combobox(guard, values=SPAM_KEYS, state="readonly", width=12)
+        self.magic_guard_key.set(normalize_output_key(self.config["magic_guard_key"]))
+        self.magic_guard_key.grid(row=1, column=1, sticky="w")
+        self.magic_guard_fields = {}
+        for row, (key, label) in enumerate((
+            ("magic_guard_key_hold", "Key hold (seconds):"),
+            ("magic_guard_wait_seconds", "Wait after buff (seconds):"),
+            ("magic_guard_checks_per_second", "Checks per second:"),
+            ("magic_guard_match_threshold", "Magic Guard match threshold:"),
+        ), start=2):
+            ttk.Label(guard, text=label).grid(row=row, column=0, sticky="w", pady=5)
+            entry = ttk.Entry(guard, width=14)
+            entry.insert(0, str(self.config[key]))
+            entry.grid(row=row, column=1, sticky="w")
+            self.magic_guard_fields[key] = entry
 
         checker = ttk.LabelFrame(checks_tab, text="VoS Map Checker", padding=10)
         checker.pack(fill="x", pady=(10, 0))
@@ -1837,6 +1882,15 @@ class VosApp:
             canvas.yview_scroll(-1 if delta > 0 else 1, "units")
 
     def read_form(self):
+        guard_settings = {key: float(entry.get()) for key, entry in self.magic_guard_fields.items()}
+        for key, lower, upper in (
+            ("magic_guard_key_hold", .001, 1),
+            ("magic_guard_wait_seconds", 0, 60),
+            ("magic_guard_checks_per_second", 1, 100),
+            ("magic_guard_match_threshold", .5, .9999),
+        ):
+            if not lower <= guard_settings[key] <= upper:
+                raise ValueError(f"{key.replace('_', ' ')} must be between {lower} and {upper}.")
         inventory_rate = float(self.inventory_check_rate.get())
         if not 1 <= inventory_rate <= 30:
             raise ValueError("Inventory checks per second must be between 1 and 30.")
@@ -1953,6 +2007,9 @@ class VosApp:
             raise ValueError("Master and VoS toggle hotkeys must be different.")
         self.config.update({
             "enabled": self.master_enabled,
+            **guard_settings,
+            "magic_guard_enabled": bool(self.magic_guard_enabled.get()),
+            "magic_guard_key": normalize_output_key(self.magic_guard_key.get()),
             "toggle_key": master_key,
             "vos_enabled": bool(self.vos_enabled.get()),
             "vos_toggle_key": vos_key,
@@ -2174,11 +2231,10 @@ class VosApp:
     def on_buff_enabled_changed(self):
         enabled = bool(self.buff_enabled.get())
         self.config["buff_enabled"] = enabled
-        self.buff_resume_not_before = 0.0
-        if not enabled and self.spam_paused_reason and (
-            self.spam_paused_reason.startswith("Buffing")
-        ):
-            self.spam_paused_reason = None
+        if getattr(self, "buff_cast_label", "Thorns") == "Thorns":
+            self.buff_resume_not_before = 0.0
+            if not enabled and self.spam_paused_reason and self.spam_paused_reason.startswith("Buffing"):
+                self.spam_paused_reason = None
         save_config(self.config)
         log(f"Thorns buff maintenance {'enabled' if enabled else 'disabled'}")
 
@@ -2189,6 +2245,16 @@ class VosApp:
             self.spam_paused_reason = "Waiting for map"
         save_config(self.config)
         log(f"VoS Map Checker {'enabled' if enabled else 'disabled'}", diagnostic=True)
+
+    def on_magic_guard_enabled_changed(self):
+        enabled = bool(self.magic_guard_enabled.get())
+        self.config["magic_guard_enabled"] = enabled
+        if not enabled and getattr(self, "buff_cast_label", None) == "Magic Guard":
+            self.buff_resume_not_before = 0.0
+            if self.spam_paused_reason and self.spam_paused_reason.startswith("Buffing"):
+                self.spam_paused_reason = None
+        save_config(self.config)
+        log(f"Magic Guard buff maintenance {'enabled' if enabled else 'disabled'}")
 
     def on_alignment_changed(self):
         enabled = bool(self.alignment_enabled.get())
@@ -2620,6 +2686,47 @@ class VosApp:
         if was_active:
             log(f"VoS spam OFF ({reason})")
 
+    def maintain_buffs(self):
+        """Own spam/movement input while casting or recovering an enabled buff."""
+        specs = (
+            ("Thorns", "buff_enabled", "thorns_detector", "buff_key", "buff_key_hold", "buff_wait_seconds", "END"),
+            ("Magic Guard", "magic_guard_enabled", "magic_guard_detector", "magic_guard_key",
+             "magic_guard_key_hold", "magic_guard_wait_seconds", "PGDN"),
+        )
+        if not any(self.config.get(spec[1], False) for spec in specs):
+            return False
+        remaining = self.buff_resume_not_before - time.monotonic()
+        if remaining > 0:
+            label = getattr(self, "buff_cast_label", "buff")
+            self.spam_paused_reason = f"Buffing ({label}, {remaining:.1f}s)"
+            return True
+        for label, enabled_key, detector_name, key_setting, hold_setting, wait_setting, default_key in specs:
+            if not self.config.get(enabled_key, False):
+                continue
+            if getattr(self, detector_name).allows_spam():
+                continue
+            self.spam_paused_reason = f"Buffing (casting {label})"
+            key = normalize_output_key(self.config.get(key_setting, default_key))
+            hold = max(.001, float(self.config.get(hold_setting, .03)))
+            with self.input_lock:
+                if self.shop_controller.needs_attention():
+                    return True
+                if self.config.get("use_arduino", True):
+                    sent = ARDUINO.send_key(self.config, key, hold)
+                else:
+                    send_windows_key(key, hold)
+                    sent = True
+            if not sent:
+                self.stop_vos(f"{label} buff key send failed")
+                return True
+            wait = max(0.0, float(self.config.get(wait_setting, 5.0)))
+            self.buff_cast_label = label
+            self.buff_resume_not_before = time.monotonic() + wait
+            self.spam_paused_reason = f"Buffing ({label}, {wait:.1f}s)"
+            log(f"{label} missing: sent {key}, waiting {wait:.1f}s")
+            return True
+        return False
+
     def _spam_loop(self):
         config = dict(self.config)
         hold = max(0.0, float(config["vos_hold"]))
@@ -2643,36 +2750,9 @@ class VosApp:
             if self.shop_controller.needs_attention():
                 self.stop_event.wait(.05)
                 continue
-            if self.config.get("buff_enabled", False):
-                now = time.monotonic()
-                if now < self.buff_resume_not_before:
-                    remaining = self.buff_resume_not_before - now
-                    self.spam_paused_reason = f"Buffing ({remaining:.1f}s)"
-                    if self.stop_event.wait(min(0.05, remaining)):
-                        break
-                    continue
-                if not self.thorns_detector.allows_spam():
-                    self.spam_paused_reason = "Buffing (casting Thorns)"
-                    buff_key = normalize_output_key(self.config.get("buff_key", "END"))
-                    buff_hold = max(0.001, float(self.config.get("buff_key_hold", 0.03)))
-                    with self.input_lock:
-                        if self.shop_controller.needs_attention():
-                            continue
-                        if self.config.get("use_arduino", True):
-                            sent = ARDUINO.send_key(self.config, buff_key, buff_hold)
-                        else:
-                            send_windows_key(buff_key, buff_hold)
-                            sent = True
-                    if not sent:
-                        self.stop_vos("Thorns buff key send failed")
-                        return
-                    wait_seconds = max(0.0, float(self.config.get("buff_wait_seconds", 5.0)))
-                    self.buff_resume_not_before = time.monotonic() + wait_seconds
-                    self.spam_paused_reason = f"Buffing ({wait_seconds:.1f}s)"
-                    log(f"Thorns missing: sent {buff_key}, waiting {wait_seconds:.1f}s")
-                    if self.stop_event.wait(min(0.05, max(0.001, wait_seconds))):
-                        break
-                    continue
+            if self.maintain_buffs():
+                self.stop_event.wait(.05)
+                continue
             if self.config.get("auto_align_enabled", False) and self.alignment_move_pending:
                 self.spam_paused_reason = "Moving"
                 if self.stop_event.wait(.05):
@@ -2828,6 +2908,11 @@ class VosApp:
             text=thorns_text + thorns_suffix,
             foreground=thorns_color,
         )
+        guard_matched, guard_text, guard_score, _, _ = self.magic_guard_detector.snapshot()
+        guard_suffix = f" ({guard_score:.2f})" if guard_text in {"Active", "Missing"} else ""
+        self.magic_guard_status.configure(text=guard_text + guard_suffix,
+            foreground="gray" if not self.config.get("magic_guard_enabled", False)
+            else "green" if guard_matched else "orange")
 
         if not self.config.get("use_arduino", True):
             arduino_text, color = "Off (Windows fallback)", "gray"
@@ -2862,6 +2947,7 @@ class VosApp:
         self.minimap_detector.stop()
         self.yeti_detector.stop()
         self.thorns_detector.stop()
+        self.magic_guard_detector.stop()
         self.shop_controller.stop()
         self.vision.stop()
         self.auto_align_stop.set()

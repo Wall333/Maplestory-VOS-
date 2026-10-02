@@ -14,7 +14,7 @@ from arrow_tracker import ArrowShapeTracker
 
 
 TEMPLATE_NAMES = (
-    "VOS_map", "yeti", "yeti2", "crown", "crown2", "thorns", "lightbulb",
+    "VOS_map", "yeti", "yeti2", "crown", "crown2", "thorns", "magic_guard", "lightbulb",
     "area", "crystal", "inventory", "shop", "shop_open", "sell_button",
     "sell_confirm", "invent_empty", "shop_exit", "minimap",
 )
@@ -47,7 +47,8 @@ class VisionRuntime:
         self.templates = {}
         self.gray_templates = {}
         for name in TEMPLATE_NAMES:
-            image = cv2.imread(os.path.join(base_dir, "assets", name + ".png"), cv2.IMREAD_COLOR)
+            filename = "magic guard" if name == "magic_guard" else name
+            image = cv2.imread(os.path.join(base_dir, "assets", filename + ".png"), cv2.IMREAD_COLOR)
             if image is not None and image.size:
                 self.templates[name] = image
                 self.gray_templates[name] = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -115,6 +116,8 @@ class VisionRuntime:
             rates.append(float(config.get("yeti_checks_per_second", 10)))
         if config.get("buff_enabled"):
             rates.append(float(config.get("thorns_checks_per_second", 2)))
+        if config.get("magic_guard_enabled"):
+            rates.append(float(config.get("magic_guard_checks_per_second", 2)))
         if config.get("minimap_checker_enabled"):
             rates.append(float(config.get("minimap_checks_per_second", 5)))
         if any(config.get(name, False) for name in (
